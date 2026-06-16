@@ -255,6 +255,16 @@ static uint64_t flash_io_read(void *opaque, hwaddr part_offset, unsigned size) {
 			// flash_trace_part(p, "%08"PRIX64": status 0x%02X", offset, value);
 			break;
 
+		case 0x94: {	// NAND-as-NOR NVRAM read-array: return stored array bytes
+			uint8_t *data = p->storage + (offset - p->offset);
+			switch (size) {
+				case 1:	value = data[0]; break;
+				case 2:	value = data[0] | (data[1] << 8); break;
+				default: value = data[0] | (data[1] << 8) | (data[2] << 16) | (data[3] << 24); break;
+			}
+			break;
+		}
+
 		default:
 			flash_error_part(p, "not implemented read for command %02X [addr: %08"PRIX64"]", p->cmd, offset);
 			exit(1);
@@ -275,7 +285,15 @@ static void flash_io_write(void *opaque, hwaddr part_offset, uint64_t value, uns
 		
 		valid_cmd = true;
 		p->cmd_addr = offset;
-		
+
+		// LG/APOXI firmware issues some setup commands with bit 2 set (0x64 = 0x60|4
+		// block-lock, 0x24 = 0x20|4 erase). No standard M18 setup command uses bit 2,
+		// so the chip ignores it; normalize before decoding. NOTE: 0x94 is NOT a
+		// read-id variant here - it is the NAND-as-NOR NVRAM read-array command
+		// (see case 0x94 below), so it is deliberately excluded.
+		if ((value & 0x04) && ((value & ~0x04u) == 0x60 || (value & ~0x04u) == 0x20))
+			value &= ~0x04u;
+
 		switch (value) {
 			case 0xFF:
 				flash_reset(p);
@@ -299,15 +317,29 @@ static void flash_io_write(void *opaque, hwaddr part_offset, uint64_t value, uns
 				p->cmd = value;
 				break;
 
+			case 0x94:
+				// NAND-as-NOR NVRAM read: the firmware's TCM flash routine primes the
+				// array with 0x94 before reading config/NVRAM bytes (0x70 -> 0x94 ->
+				// ldrb -> 0xFF). Return the stored array data via the io handler (a
+				// romd switch here doesn't take effect on the same-TB ldrb). Without
+				// this it was normalized to read-id 0x90 and every NVRAM byte read back
+				// 0xFFFF - the "read unknown cfi index" flood.
+				flash_trace_part(p, "cmd read array via 0x94 (%02"PRIX64")", value);
+				p->cmd = value;
+				break;
+
 			case 0x98:
 				flash_trace_part(p, "cmd read cfi (%02"PRIX64")", value);
 				p->cmd = value;
 				break;
 
 			case 0x50:
+				// Clear Status Register: single-cycle command. Reset the status bits to
+				// the default (ready) and stay in read-status mode; does not start a
+				// multi-cycle sequence.
 				flash_trace_part(p, "cmd clear status (%02"PRIX64")", value);
-				p->cmd = value;
-				p->wcycle++;
+				p->status = 0x80;
+				p->cmd = 0x70;
 				break;
 
 			case 0x41:
@@ -341,8 +373,15 @@ static void flash_io_write(void *opaque, hwaddr part_offset, uint64_t value, uns
 
 			case 0xB0:
 				flash_trace_part(p, "cmd suspend (%02"PRIX64")", value);
-				p->cmd = value;
-				p->wcycle++;
+				p->status |= 0x80 | 0x40 | 0x04;
+				p->cmd = 0x70;
+				break;
+
+			case 0xD0:
+				flash_trace_part(p, "cmd resume (%02"PRIX64")", value);
+				p->status |= 0x80;
+				p->status &= ~(0x40 | 0x04);
+				p->cmd = 0;
 				break;
 
 			case 0x60:
@@ -350,6 +389,7 @@ static void flash_io_write(void *opaque, hwaddr part_offset, uint64_t value, uns
 				p->cmd = value;
 				p->wcycle++;
 				break;
+
 
 			case 0xC0:
 				flash_trace_part(p, "cmd protection program (%02"PRIX64")", value);
@@ -465,6 +505,21 @@ static void flash_io_write(void *opaque, hwaddr part_offset, uint64_t value, uns
 				p->wcycle = 0;
 				p->status |= 0x80;
 				break;
+
+			case 0xC0: {	// program OTP / lock register
+				valid_cmd = true;
+				const pmb887x_flash_cfg_t *otp_cfg = p->flash->cfg;
+				uint16_t otp_index = (offset >> 1) & 0xFFF;
+				// OTP is one-time-programmable: programming only clears bits (AND).
+				if (otp_index >= otp_cfg->otp0_addr && otp_index < otp_cfg->otp0_addr + (otp_cfg->otp0_size / 2))
+					p->flash->otp0_data[otp_index - otp_cfg->otp0_addr] &= value;
+				else if (otp_index >= otp_cfg->otp1_addr && otp_index < otp_cfg->otp1_addr + (otp_cfg->otp1_size / 2))
+					p->flash->otp1_data[otp_index - otp_cfg->otp1_addr] &= value;
+				flash_trace_part(p, "program OTP/lock reg [%03X]: %04"PRIX64"", otp_index, value & 0xFFFF);
+				p->wcycle = 0;
+				p->status |= 0x80;
+				break;
+			}
 		}
 	} else if (p->wcycle == 2) {
 		switch (p->cmd) {
@@ -613,6 +668,7 @@ static void flash_init_part(pmb887x_flash_t *flash, const pmb887x_flash_cfg_part
 	p->offset = part_cfg->offset;
 	p->size = part_cfg->size;
 	p->cfg = part_cfg;
+	p->status = 0x80; // SR7 ready: power-up default per datasheet (0x0080)
 	
 	char *name = g_strdup_printf("pmb887x-flash[%s][%d]", p->flash->name, p->n);
 	memory_region_init_rom_device(&p->mem, OBJECT(p->flash->dev), &io_ops, p, name, p->size, NULL);

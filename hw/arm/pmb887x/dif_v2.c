@@ -75,6 +75,7 @@ struct pmb887x_dif_t {
 
 	QEMUTimer *timer;
 	bool transfer_pending;
+	bool in_schedule;
 
 	bool fifo_req;
 	uint32_t tx_remaining;
@@ -168,10 +169,13 @@ static inline uint32_t dif_get_bsconf_size(pmb887x_dif_t *p) {
 		case DIFv2_CSREG_BSCONF_OFF:
 			return 0;
 		case DIFv2_CSREG_BSCONF_1x8BIT:
+		case DIFv2_CSREG_BSCONF_1x9BIT:
 			return 1;
 		case DIFv2_CSREG_BSCONF_2x8BIT:
+		case DIFv2_CSREG_BSCONF_2x9BIT:
 			return 2;
 		case DIFv2_CSREG_BSCONF_3x8BIT:
+		case DIFv2_CSREG_BSCONF_3x9BIT:
 			return 3;
 		case DIFv2_CSREG_BSCONF_4x8BIT:
 			return 4;
@@ -208,10 +212,18 @@ static void dif_update_gpio_state(pmb887x_dif_t *p) {
 }
 
 static void dif_schedule(pmb887x_dif_t *p) {
-	if (!p->transfer_pending) {
-		p->transfer_pending = true;
-		timer_mod(p->timer, 0);
+	p->transfer_pending = true;
+	if (p->in_schedule)
+		return;
+
+	p->in_schedule = true;
+	while (p->transfer_pending) {
+		p->transfer_pending = false;
+		dif_work(p);
+		if (pmb887x_srb_get_ris(&p->srb) != 0)
+			break;
 	}
+	p->in_schedule = false;
 }
 
 static void dif_trigger_dma(pmb887x_dif_t *p) {
@@ -433,9 +445,16 @@ static void dif_tx_from_fifo(pmb887x_dif_t *p) {
 		p->tx_remaining -= bytes_in_fifo_reg;
 
 		if (bsconf_size != 0) {
-			for (uint32_t i = 0; i < bsconf_size; i++) {
-				uint8_t byte = (value >> (8 * i)) & 0xFF;
-				ssi_transfer(p->bus, byte);
+			// A 32-bit FIFO word packs (4 / align) pixel-lanes, each carrying
+			// bsconf_size bytes on the bus (e.g. 2x8BIT/align=2 packs two 16-bit
+			// pixels). Serialize every lane, low byte first, matching the LCD's
+			// byte assembly order.
+			uint32_t lanes = 4 / align;
+			for (uint32_t lane = 0; lane < lanes; lane++) {
+				for (uint32_t i = 0; i < bsconf_size; i++) {
+					uint8_t byte = (value >> (8 * (lane * align + i))) & 0xFF;
+					ssi_transfer(p->bus, byte);
+				}
 			}
 		} else {
 			if (bytes_in_fifo_reg == 0)

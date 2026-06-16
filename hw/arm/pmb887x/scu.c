@@ -123,7 +123,15 @@ static uint64_t scu_io_read(void *opaque, hwaddr haddr, unsigned size) {
 			// value = SCU_RST_SR_RSSTM | SCU_RST_SR_HDRST | SCU_RST_SR_RSEXT | 0x5000;
 			value = SCU_RST_SR_PWDRST | SCU_RST_SR_RSSTM | SCU_RST_SR_RSEXT;
 			break;
-		
+
+		case 0x14: // undocumented reset/power-on-status register (read by LG firmware).
+			// bit0 set: the boot-reason check treats clear-bit0 as "no wake reason"
+			// and halts (power off), so report a valid power-on cause.
+			value = 1;
+			break;
+		case 0x20: // ???
+			break;
+
 		case SCU_WDT_SR:
 		{
 			uint32_t counter = (p->wdtcon0 & SCU_WDTCON0_WDTPW) >> SCU_WDTCON0_WDTPW_SHIFT;
@@ -208,13 +216,13 @@ static uint64_t scu_io_read(void *opaque, hwaddr haddr, unsigned size) {
 			break;
 		
 		default:
-			IO_DUMP(haddr + p->mmio.addr, size, 0xFFFFFFFF, false);
-			EPRINTF("unknown reg access: %02"PRIX64"\n", haddr);
-			exit(1);
+			fprintf(stderr, "SCU rd unk %02"PRIX64" PC=%08X\n", haddr, ARM_CPU(qemu_get_cpu(0))->env.regs[15]);
+			value = 0;
+			break;
 	}
-	
+
 	IO_DUMP(haddr + p->mmio.addr, size, value, false);
-	
+
 	return value;
 }
 
@@ -292,7 +300,11 @@ static void scu_io_write(void *opaque, hwaddr haddr, uint64_t value, unsigned si
 		case SCU_DSP_UNK0:
 			p->dsp_unk0 = value;
 		break;
-		
+
+		case 0x14: // undocumented reset/power-on-status register?
+		case 0x20: // ???
+		break;
+
 		case SCU_EXTI0_SRC:
 		case SCU_EXTI1_SRC:
 		case SCU_EXTI2_SRC:
@@ -319,8 +331,8 @@ static void scu_io_write(void *opaque, hwaddr haddr, uint64_t value, unsigned si
 		break;
 		
 		default:
-			EPRINTF("unknown reg access: %02"PRIX64"\n", haddr);
-			exit(1);
+			fprintf(stderr, "SCU wr unk %02"PRIX64"=%08"PRIX64" PC=%08X\n", haddr, value, ARM_CPU(qemu_get_cpu(0))->env.regs[15]);
+		break;
 	}
 	
 	scu_update_state(p);

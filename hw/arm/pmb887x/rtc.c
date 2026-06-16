@@ -72,7 +72,13 @@ static uint64_t rtc_io_read(void *opaque, hwaddr haddr, unsigned size) {
 			break;
 		
 		case RTC_CNT:
-			value = get_clock_realtime() / NANOSECONDS_PER_SECOND;
+			// Deterministic RTC: derive the count from the virtual (icount) clock
+			// instead of host real-time. Real-time made boot non-deterministic - the
+			// firmware's NVRAM reformat path branches on RTC timing, so identical runs
+			// could either progress or hang at A2162AA0 depending on host I/O speed.
+			// Fixed epoch base (2008-07-15, the firmware's build date) + virtual elapsed.
+			value = (1216080000ULL +
+				(qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) - p->virtual_start) / NANOSECONDS_PER_SECOND);
 			break;
 		
 		case RTC_REL:

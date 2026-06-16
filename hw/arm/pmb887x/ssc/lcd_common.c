@@ -468,7 +468,7 @@ void pmb887x_lcd_set_ram_mode(pmb887x_lcd_t *lcd, bool flag) {
 
 static uint32_t lcd_transfer(SSIPeripheral *dev, uint32_t data) {
 	pmb887x_lcd_t *lcd = PMB887X_LCD(dev);
-	if (lcd->wr_state == LCD_WR_STATE_RAM) {
+	if (lcd->wr_state == LCD_WR_STATE_RAM && !lcd->cd) {
 		uint32_t index = lcd->buffer_y * lcd->width + lcd->buffer_x;
 		lcd->buffer[index * lcd->byte_pp + (lcd->byte_pp - lcd->tmp_index - 1)] = data | lcd->byte_fill;
 		lcd->tmp_index++;
@@ -509,8 +509,6 @@ static void lcd_handle_wr(void *opaque, int n, int level) {
 static void lcd_handle_cd(void *opaque, int n, int level) {
 	pmb887x_lcd_t *lcd = PMB887X_LCD(opaque);
 	pmb887x_lcd_set_cd(lcd, level == 0);
-	if (lcd->cd && lcd->wr_state == LCD_WR_STATE_RAM)
-		pmb887x_lcd_set_ram_mode(lcd, false);
 }
 
 static void lcd_handle_reset(void *opaque, int n, int level) {

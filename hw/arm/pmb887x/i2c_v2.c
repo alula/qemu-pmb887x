@@ -339,6 +339,13 @@ static void i2c_start_tx(pmb887x_i2c_t *p) {
 	if (!i2c_is_running(p))
 		return;
 
+	// LG APOXI reads each <=MRPS chunk then immediately issues the next repeated-START
+	// chunk (TPSCTRL/TXD) before the deferred transfer_done timer fires. If the previous
+	// receive phase is fully drained, finalize it synchronously here so the new TX phase
+	// can start instead of getting stuck in a stale MASTER_RX.
+	if (p->state == I2C_STATE_MASTER_RX && p->rx_remaining == 0 && pmb887x_fifo_is_empty(&p->fifo))
+		i2c_transfer_done(p);
+
 	if (p->state != I2C_STATE_MASTER_RESTART && p->state != I2C_STATE_NONE)
 		return;
 
@@ -457,8 +464,18 @@ static void i2c_work(pmb887x_i2c_t *p) {
 
 		i2c_fifo_req(p);
 
-		if (p->rx_remaining == 0 && pmb887x_fifo_is_empty(&p->fifo))
-			i2c_transfer_done(p);
+		if (p->rx_remaining == 0) {
+			if (pmb887x_fifo_is_empty(&p->fifo)) {
+				i2c_transfer_done(p);
+			} else {
+				// Programmed MRPS count clocked in: the transfer phase is complete and
+				// real HW raises TX_END here, with the received data still waiting in the
+				// FIFO for the CPU to drain via RXD. Some firmwares (e.g. LG APOXI) poll
+				// for RX|TX_END before reading RXD, so defer i2c_transfer_done() until the
+				// FIFO is drained but signal TX_END now.
+				pmb887x_srb_ext_set_isr(&p->srb_proto, I2Cv2_PIRQSS_TX_END);
+			}
+		}
 	} else if (p->state == I2C_STATE_MASTER_RESTART) {
 		if (p->enddctrl_end) {
 			i2c_transfer_done(p);

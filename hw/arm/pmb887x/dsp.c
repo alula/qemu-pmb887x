@@ -122,6 +122,7 @@ static void dsp_io_write(void *opaque, hwaddr haddr, uint64_t value, unsigned si
 
 		case DSP_UNK0:
 			p->unk[0] = value;
+			p->unk[1] = 0;
 			break;
 
 		case DSP_UNK1:

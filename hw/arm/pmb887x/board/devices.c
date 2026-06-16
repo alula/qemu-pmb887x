@@ -11,10 +11,38 @@
 #include "hw/hw.h"
 #include "hw/sysbus.h"
 #include "hw/qdev-core.h"
+#include "system/address-spaces.h"
+#include "system/memory.h"
 #include "qom/object.h"
 #include "hw/qdev-properties.h"
 #include "hw/i2c/i2c.h"
 #include "qapi/error.h"
+
+// --- TEMP instrumentation: detect whether firmware ever accesses flash-tail (0xA8000000) ---
+static uint8_t *g_flash_tail_buf;
+static uint32_t g_flash_tail_size;
+static uint64_t g_flash_tail_reads;
+static uint64_t flash_tail_dbg_read(void *opaque, hwaddr addr, unsigned size) {
+	uint64_t v = 0;
+	if (addr + size <= g_flash_tail_size)
+		memcpy(&v, g_flash_tail_buf + addr, size);
+	if (g_flash_tail_reads < 128)
+		fprintf(stderr, "[FLASH-TAIL] READ  off=0x%05x sz=%u val=0x%llx\n",
+			(uint32_t)addr, size, (unsigned long long)v);
+	g_flash_tail_reads++;
+	return v;
+}
+static void flash_tail_dbg_write(void *opaque, hwaddr addr, uint64_t val, unsigned size) {
+	if (addr + size <= g_flash_tail_size)
+		memcpy(g_flash_tail_buf + addr, &val, size);
+	fprintf(stderr, "[FLASH-TAIL] WRITE off=0x%05x sz=%u val=0x%llx\n",
+		(uint32_t)addr, size, (unsigned long long)val);
+}
+static const MemoryRegionOps flash_tail_dbg_ops = {
+	.read = flash_tail_dbg_read,
+	.write = flash_tail_dbg_write,
+	.endianness = DEVICE_NATIVE_ENDIAN,
+};
 
 typedef enum pmb887x_dev_prop_type_t pmb887x_dev_prop_type_t;
 typedef enum pmb887x_dev_bus_type_t pmb887x_dev_bus_type_t;
@@ -94,6 +122,17 @@ static pmb887x_dev_t devices_meta[] = {
 			{ "bgr_filter", DEV_PROP_BOOL, false },
 		},
 	},
+	{
+		.name = "ili9320",
+		.props = {
+			{ "width", DEV_PROP_UINT, true },
+			{ "height", DEV_PROP_UINT, true },
+			{ "rotation", DEV_PROP_UINT, false },
+			{ "flip_horizontal", DEV_PROP_BOOL, false },
+			{ "flip_vertical", DEV_PROP_BOOL, false },
+			{ "bgr_filter", DEV_PROP_BOOL, false },
+		},
+	},
 
 	// PMIC
 	{
@@ -134,6 +173,12 @@ static pmb887x_dev_t devices_meta[] = {
 	// SDRAM
 	{
 		.name = "sdram",
+		.props = {},
+	},
+
+	// Flash tail region (e.g. NVRAM/caldata mapped past the NOR, as-flashed)
+	{
+		.name = "flash-tail",
 		.props = {},
 	},
 };
@@ -266,8 +311,48 @@ static DeviceState *device_create_from_config(DeviceState *ebuc, const char *id,
 				uint32_t vid = toml_table_get_uint32(table, "flash.vid", 0, true);
 				uint32_t pid = toml_table_get_uint32(table, "flash.pid", 0, true);
 				uint32_t bank_size;
-				pmb887x_board_ebu_connect(DEVICE(bus), cs, pmb887x_board_create_nor_flash(id, vid, pid, board->flash_offset, &bank_size));
+				MemoryRegion *flash_mr = pmb887x_board_create_nor_flash(id, vid, pid, board->flash_offset, &bank_size);
+				pmb887x_board_ebu_connect(DEVICE(bus), cs, flash_mr);
 				board->flash_offset += bank_size;
+
+				// A flash chip larger than a single 64MB EBU window is wired across
+				// consecutive even chip-selects (e.g. 128MB NOR: CS_n = low 64MB,
+				// CS_n+2 = high 64MB). Alias the remaining halves onto those CSes.
+				static const uint32_t EBU_WINDOW = 0x4000000; // 64MB
+				for (uint32_t off = EBU_WINDOW, extra_cs = cs + 2; off < bank_size; off += EBU_WINDOW, extra_cs += 2) {
+					MemoryRegion *alias = g_new(MemoryRegion, 1);
+					char alias_name[64];
+					sprintf(alias_name, "%s.cs%u", id, extra_cs);
+					memory_region_init_alias(alias, NULL, alias_name, flash_mr, off, MIN(EBU_WINDOW, bank_size - off));
+					pmb887x_board_ebu_connect(DEVICE(bus), extra_cs, alias);
+				}
+			} else if (strcmp(type, "flash-tail") == 0) {
+				// A region of the flash image that lives past the NOR main array and
+				// is not wired through an EBU chip-select (the firmware accesses it at
+				// a fixed physical address). Map it directly into system memory,
+				// preloaded as-flashed from the tail of the fullflash image. Used for
+				// the KE970 NVRAM/caldata bank at 0xA8000000.
+				uint32_t address = toml_table_get_uint32(table, "address", 0, true);
+				uint32_t size = toml_table_get_uint32(table, "size", 0, true);
+
+				pmb887x_flash_blk_t *flash_blk =
+					pmb887x_flash_blk_self(qdev_find_recursive(sysbus_get_default(), "FULLFLASH"));
+				int64_t total = pmb887x_flash_blk_size(flash_blk);
+				int64_t tail = total - board->flash_offset;
+				if (tail < 0)
+					tail = 0;
+
+				MemoryRegion *region = g_new(MemoryRegion, 1);
+				g_flash_tail_size = size;
+				g_flash_tail_buf = g_malloc(size);
+				memset(g_flash_tail_buf, 0xFF, size);
+				if (tail > 0)
+					pmb887x_flash_blk_pread(flash_blk, board->flash_offset, MIN((int64_t)size, tail), g_flash_tail_buf);
+				memory_region_init_io(region, NULL, &flash_tail_dbg_ops, NULL, id, size);
+				memory_region_add_subregion(get_system_memory(), address, region);
+
+				// Consume the remaining image bytes so the fullflash size check passes.
+				board->flash_offset += tail;
 			} else {
 				error_report("Invalid dev type: %s", type);
 				exit(EXIT_FAILURE);
