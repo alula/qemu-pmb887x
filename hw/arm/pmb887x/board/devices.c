@@ -18,32 +18,6 @@
 #include "hw/i2c/i2c.h"
 #include "qapi/error.h"
 
-// --- TEMP instrumentation: detect whether firmware ever accesses flash-tail (0xA8000000) ---
-static uint8_t *g_flash_tail_buf;
-static uint32_t g_flash_tail_size;
-static uint64_t g_flash_tail_reads;
-static uint64_t flash_tail_dbg_read(void *opaque, hwaddr addr, unsigned size) {
-	uint64_t v = 0;
-	if (addr + size <= g_flash_tail_size)
-		memcpy(&v, g_flash_tail_buf + addr, size);
-	if (g_flash_tail_reads < 128)
-		fprintf(stderr, "[FLASH-TAIL] READ  off=0x%05x sz=%u val=0x%llx\n",
-			(uint32_t)addr, size, (unsigned long long)v);
-	g_flash_tail_reads++;
-	return v;
-}
-static void flash_tail_dbg_write(void *opaque, hwaddr addr, uint64_t val, unsigned size) {
-	if (addr + size <= g_flash_tail_size)
-		memcpy(g_flash_tail_buf + addr, &val, size);
-	fprintf(stderr, "[FLASH-TAIL] WRITE off=0x%05x sz=%u val=0x%llx\n",
-		(uint32_t)addr, size, (unsigned long long)val);
-}
-static const MemoryRegionOps flash_tail_dbg_ops = {
-	.read = flash_tail_dbg_read,
-	.write = flash_tail_dbg_write,
-	.endianness = DEVICE_NATIVE_ENDIAN,
-};
-
 typedef enum pmb887x_dev_prop_type_t pmb887x_dev_prop_type_t;
 typedef enum pmb887x_dev_bus_type_t pmb887x_dev_bus_type_t;
 typedef struct pmb887x_dev_prop_t pmb887x_dev_prop_t;
@@ -161,6 +135,12 @@ static pmb887x_dev_t devices_meta[] = {
 	// Audio Codec
 	{
 		.name = "b00b10b",
+		.props = {},
+	},
+
+	// Audio amplifier (LM4845/LM4946)
+	{
+		.name = "lm4946",
 		.props = {},
 	},
 
@@ -343,12 +323,11 @@ static DeviceState *device_create_from_config(DeviceState *ebuc, const char *id,
 					tail = 0;
 
 				MemoryRegion *region = g_new(MemoryRegion, 1);
-				g_flash_tail_size = size;
-				g_flash_tail_buf = g_malloc(size);
-				memset(g_flash_tail_buf, 0xFF, size);
+				memory_region_init_ram(region, NULL, id, size, &error_fatal);
+				uint8_t *ptr = memory_region_get_ram_ptr(region);
+				memset(ptr, 0xFF, size);
 				if (tail > 0)
-					pmb887x_flash_blk_pread(flash_blk, board->flash_offset, MIN((int64_t)size, tail), g_flash_tail_buf);
-				memory_region_init_io(region, NULL, &flash_tail_dbg_ops, NULL, id, size);
+					pmb887x_flash_blk_pread(flash_blk, board->flash_offset, MIN((int64_t)size, tail), ptr);
 				memory_region_add_subregion(get_system_memory(), address, region);
 
 				// Consume the remaining image bytes so the fullflash size check passes.

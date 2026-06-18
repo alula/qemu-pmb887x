@@ -191,10 +191,10 @@ static uint64_t ebu_io_read(void *opaque, hwaddr haddr, unsigned size) {
 
 		default:
 			IO_DUMP(haddr + p->mmio.addr, size, 0xFFFFFFFF, false);
-			EPRINTF("unknown reg access: %02"PRIX64"\n", haddr);
+			EPRINTF("unknown r reg access: %02"PRIX64"\n", haddr);
 			exit(1);
 	}
-	
+
 	IO_DUMP(haddr + p->mmio.addr, size, value, false);
 	
 	#if PMB887X_IO_BRIDGE
@@ -288,10 +288,10 @@ static void ebu_io_write(void *opaque, hwaddr haddr, uint64_t value, unsigned si
 			break;
 
 		default:
-			EPRINTF("unknown reg access: %02"PRIX64"\n", haddr);
+			EPRINTF("unknown w reg access: %02"PRIX64"\n", haddr);
 			exit(1);
 	}
-	
+
 	#if PMB887X_IO_BRIDGE
 	pmb8876_io_bridge_read(haddr + p->mmio.addr, size);
 	#endif

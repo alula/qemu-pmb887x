@@ -140,6 +140,7 @@ static void dmac_transfer_memory(pmb887x_dmac_t *p, pmb887x_dmac_ch_t *ch, uint3
 	uint32_t dst_width = dmac_get_width((ch->control & DMAC_CH_CONTROL_D_WIDTH) >> DMAC_CH_CONTROL_D_WIDTH_SHIFT);
 	uint32_t flow_ctrl = (ch->config & DMAC_CH_CONFIG_FLOW_CTRL);
 	uint32_t tx_size = (ch->control & DMAC_CH_CONTROL_TRANSFER_SIZE) >> DMAC_CH_CONTROL_TRANSFER_SIZE_SHIFT;
+	uint32_t burst_count = burst_size;	// the dst==src loop below consumes burst_size to 0
 
 	bool dmac_is_fc = (
 		flow_ctrl == DMAC_CH_CONFIG_FLOW_CTRL_MEM2MEM ||
@@ -223,7 +224,7 @@ static void dmac_transfer_memory(pmb887x_dmac_t *p, pmb887x_dmac_ch_t *ch, uint3
 		if (!dmac_is_fc)
 			hw_error("TransferSize must be zero when peripheral is flow controller!");
 
-		tx_size -= burst_size;
+		tx_size -= MIN(tx_size, burst_count);
 		ch->control &= ~DMAC_CH_CONTROL_TRANSFER_SIZE;
 		ch->control |= tx_size << DMAC_CH_CONTROL_TRANSFER_SIZE_SHIFT;
 

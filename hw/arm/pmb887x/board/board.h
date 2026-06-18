@@ -20,6 +20,7 @@ struct pmb887x_board_t {
 	toml_datum_t config;
 
 	uint32_t keymap[Q_KEY_CODE__MAX];
+	uint32_t poweron_matrix;	// matrix bits of the key held at power-on (0 = none)
 
 	pmb887x_cpu_meta_gpio_t *gpios;
 	uint32_t gpios_count;

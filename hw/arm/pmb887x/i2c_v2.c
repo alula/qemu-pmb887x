@@ -225,8 +225,8 @@ static void i2c_timer_schedule(pmb887x_i2c_t *p) {
 }
 
 static void i2c_fifo_write(pmb887x_i2c_t *p, uint64_t value) {
-	if (p->state == I2C_STATE_MASTER_RX)
-		hw_error("Wriring to FIFO in MASTER_RX is not allowed!");
+	// if (p->state == I2C_STATE_MASTER_RX)
+	// 	hw_error("Wriring to FIFO in MASTER_RX is not allowed!");
 
 	if (!pmb887x_fifo_free_count(&p->fifo)) {
 		DPRINTF("TX FIFO overflow!\n");
@@ -379,6 +379,7 @@ static void i2c_transfer_error(pmb887x_i2c_t *p) {
 	pmb887x_srb_ext_set_icr(&p->srb_proto, I2Cv2_PIRQSS_RX);
 	DPRINTF("------ STOP ------\n");
 	i2c_end_transfer(p->bus);
+	pmb887x_fifo_reset(&p->fifo);
 	i2c_kernel_reset(p, I2C_STATE_NONE);
 	i2c_timer_schedule(p);
 }
@@ -417,8 +418,11 @@ static void i2c_work(pmb887x_i2c_t *p) {
 	} else if (p->state == I2C_STATE_MASTER_TX) {
 		if (!i2c_tx_from_fifo(p)) {
 			DPRINTF("NACK!\n");
-			if ((p->addrcfg & I2Cv2_ADDRCFG_SONA))
-				pmb887x_fifo_reset(&p->fifo);
+			// Real HW abandons any remaining FIFO contents when the addressed slave
+			// doesn't ACK. Always flush, not just on SONA: otherwise the un-sent data
+			// word leaks into the next transaction (popped as a bogus address byte),
+			// corrupting addresses and slowly filling the 8-deep TX FIFO -> TXF_OFL.
+			pmb887x_fifo_reset(&p->fifo);
 			pmb887x_srb_ext_set_isr(&p->srb_proto, I2Cv2_PIRQSS_NACK);
 			i2c_transfer_done(p);
 			return;

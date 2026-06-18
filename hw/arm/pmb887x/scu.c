@@ -121,6 +121,11 @@ static uint64_t scu_io_read(void *opaque, hwaddr haddr, unsigned size) {
 		
 		case SCU_RST_SR:
 			// value = SCU_RST_SR_RSSTM | SCU_RST_SR_HDRST | SCU_RST_SR_RSEXT | 0x5000;
+			// NOTE: setting WDTRST (bit30) here satisfies the PMI startup gate
+			// (nu_sys_initialize -> dword_B01282F4 -> startup mask bit4 0x10) BUT regresses
+			// boot - an earlier consumer of the watchdog-reset cause diverges before the PMI
+			// stage (no capcom 5C, PSRAM never inits, PC stuck ~0x513c). Needs the early
+			// WDTRST consumer understood / watchdog modelled before this can be the fix.
 			value = SCU_RST_SR_PWDRST | SCU_RST_SR_RSSTM | SCU_RST_SR_RSEXT;
 			break;
 

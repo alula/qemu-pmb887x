@@ -68,6 +68,8 @@ void pmb887x_board_keymap_init(void) {
 		return;
 	for (int i = 0; i < table.u.tab.size; i++) {
 		const char *key_name = table.u.tab.key[i];
+		if (strcmp(key_name, "poweron_key") == 0)	// handled after the loop, not a matrix entry
+			continue;
 		uint32_t keycode = 0;
 		toml_datum_t arr = toml_table_get(table, TOML_ARRAY, key_name, true);
 		if (arr.u.arr.size < 2) {
@@ -93,5 +95,21 @@ void pmb887x_board_keymap_init(void) {
 
 		if (!found)
 			warn_report("Unknown key '%s' in board config!", key_name);
+	}
+
+	// Optional: a key held down at power-on so the firmware sees a power/END-key
+	// boot cause (e.g. KE970 "poweron_key = END_CALL"). Resolve its name to the
+	// matrix bits computed above.
+	const char *poweron_key = toml_table_get_string(table, "poweron_key", NULL, false);
+	if (poweron_key) {
+		toml_datum_t arr = toml_table_get(table, TOML_ARRAY, poweron_key, false);
+		if (arr.type == TOML_ARRAY && arr.u.arr.size >= 2) {
+			uint32_t m = 1 << toml_array_get_uint32(arr, 0, 0, true);
+			for (int j = 1; j < arr.u.arr.size; j++)
+				m |= 1 << (8 + toml_array_get_uint32(arr, j, 0, true));
+			board->poweron_matrix = m;
+		} else {
+			warn_report("poweron_key '%s' not found in [keyboard]!", poweron_key);
+		}
 	}
 }

@@ -16,584 +16,107 @@
 
 #include "hw/arm/pmb887x/trace.h"
 #include "hw/arm/pmb887x/flash.h"
+#include "hw/arm/pmb887x/flash-internal.h"
 #include "hw/arm/pmb887x/flash-blk.h"
 
 #define TYPE_PMB887X_FLASH	"pmb887x-flash"
 #define PMB887X_FLASH(obj)	OBJECT_CHECK(pmb887x_flash_t, (obj), TYPE_PMB887X_FLASH)
 
-#define CFI_ADDR	0x10
-
-typedef struct pmb887x_flash_t pmb887x_flash_t;
-typedef struct pmb887x_flash_part_t pmb887x_flash_part_t;
-typedef struct pmb887x_flash_buffer_t pmb887x_flash_buffer_t;
-typedef struct pmb887x_flash_block_t pmb887x_flash_block_t;
-
-struct pmb887x_flash_t;
-
-struct pmb887x_flash_buffer_t {
-	uint32_t offset;
-	uint32_t value;
-	uint8_t size;
-};
-
-struct pmb887x_flash_block_t {
-	uint32_t offset;
-	uint32_t size;
-	bool locked;
-};
-
-struct pmb887x_flash_part_t {
-	uint16_t n;
-	uint32_t size;
-	uint32_t offset;
-	
-	uint8_t wcycle;
-	uint8_t cmd;
-	uint32_t cmd_addr;
-	uint8_t status;
-	
-	void *storage;
-	
-	uint32_t buffer_size;
-	uint32_t buffer_index;
-	pmb887x_flash_buffer_t *buffer;
-	const pmb887x_flash_cfg_part_t *cfg;
-	
-	uint32_t blocks_n;
-	pmb887x_flash_block_t *blocks;
-	
-	MemoryRegion mem;
-	pmb887x_flash_t *flash;
-};
-
-struct pmb887x_flash_t {
-	SysBusDevice parent_obj;
-	DeviceState *dev;
-	MemoryRegion mmio;
-	
-	pmb887x_flash_blk_t *blk;
-	const pmb887x_flash_cfg_t *cfg;
-	
-	char *name;
-	
-	uint16_t vid;
-	uint16_t pid;
-	
-	uint16_t hex_otp0_lock;
-	char *hex_otp0_data;
-	
-	uint16_t hex_otp1_lock;
-	char *hex_otp1_data;
-	
-	uint32_t size;
-	uint32_t offset;
-	
-	uint16_t *otp0_data;
-	uint16_t *otp1_data;
-	
-	uint32_t parts_n;
-};
-
 static void flash_trace(pmb887x_flash_t *flash, const char *format, ...) G_GNUC_PRINTF(2, 3);
 static void flash_error(pmb887x_flash_t *flash, const char *format, ...) G_GNUC_PRINTF(2, 3);
 
-static void flash_trace_part(pmb887x_flash_part_t *p, const char *format, ...) G_GNUC_PRINTF(2, 3);
-static void flash_error_part(pmb887x_flash_part_t *p, const char *format, ...) G_GNUC_PRINTF(2, 3);
-
-static void flash_reset(pmb887x_flash_part_t *p) {
-	flash_trace_part(p, "back to read array mode");
+void pmb887x_flash_reset(pmb887x_flash_part_t *p) {
+	pmb887x_flash_trace_part(p, "back to read array mode");
 	p->cmd = 0;
 	p->wcycle = 0;
-	memory_region_rom_device_set_romd(&p->mem, true);
+	// Read-Array (0xFF) dismisses any pending operation status: subsequent plain
+	// reads return array data, not status (see op_pending in flash-internal.h).
+	p->op_pending = false;
+	// NVRAM/FFS partitions stay pinned to io-mode (see nvram_mode); array reads
+	// are served by the command handler, so we skip the costly romd transaction.
+	if (!p->nvram_mode)
+		memory_region_rom_device_set_romd(&p->mem, true);
 }
 
-static pmb887x_flash_block_t *flash_part_find_block(pmb887x_flash_part_t *p, uint32_t offset) {
+pmb887x_flash_block_t *pmb887x_flash_part_find_block(pmb887x_flash_part_t *p, uint32_t offset) {
 	offset -= p->offset;
 	for (uint32_t i = 0; i < p->blocks_n; i++) {
 		pmb887x_flash_block_t *blk = &p->blocks[i];
 		if (offset >= blk->offset && offset < blk->offset + blk->size)
 			return blk;
 	}
-	flash_error_part(p, "[data] Unknown addr %08X", p->flash->offset + p->offset + offset);
+	pmb887x_flash_error_part(p, "[data] Unknown addr %08X", p->flash->offset + p->offset + offset);
 	exit(1);
 }
 
-static uint32_t flash_find_sector_size(pmb887x_flash_part_t *p, uint32_t offset) {
+uint32_t pmb887x_flash_find_sector_size(pmb887x_flash_part_t *p, uint32_t offset) {
 	offset -= p->offset;
-	
+
 	for (int i = 0; i < p->cfg->erase_regions_cnt; i++) {
 		const pmb887x_flash_erase_region_t *region = &p->cfg->erase_regions[i];
 		if (offset >= region->offset && offset < region->offset + region->size)
 			return region->sector;
 	}
-	
-	flash_error_part(p, "[data] Unknown sector size for addr %08X", p->flash->offset + p->offset + offset);
+
+	pmb887x_flash_error_part(p, "[data] Unknown sector size for addr %08X", p->flash->offset + p->offset + offset);
 	exit(1);
 }
 
-static void flash_data_write(pmb887x_flash_part_t *p, uint32_t offset, uint32_t value, unsigned size) {
+void pmb887x_flash_data_write(pmb887x_flash_part_t *p, uint32_t offset, uint32_t value, unsigned size) {
 	uint8_t *data = p->storage;
-	
+
 	if (offset < p->offset || (offset + size) > p->offset + p->size) {
-		flash_error_part(p, "[data] Unknown write addr %08X [part %08X-%08X]", offset, p->offset, p->offset + p->size - 1);
+		pmb887x_flash_error_part(p, "[data] Unknown write addr %08X [part %08X-%08X]", offset, p->offset, p->offset + p->size - 1);
 		exit(1);
 	}
-	
+
 	offset -= p->offset;
-	
+
 	switch (size) {
 		case 1:
 			data[offset] &= value & 0xFF;
 			break;
-		
+
 		case 2:
 			data[offset] &= value & 0xFF;
 			data[offset + 1] &= (value >> 8) & 0xFF;
 			break;
-		
+
 		case 4:
 			data[offset] &= value & 0xFF;
 			data[offset + 1] &= (value >> 8) & 0xFF;
 			data[offset + 2] &= (value >> 16) & 0xFF;
 			data[offset + 3] &= (value >> 24) & 0xFF;
 			break;
-		
+
 		default:
-			flash_error_part(p, "[data] Unknown write size %d", size);
+			pmb887x_flash_error_part(p, "[data] Unknown write size %d", size);
 			exit(1);
 	}
-	
+
 	if (pmb887x_flash_blk_is_rw(p->flash->blk)) {
 		int ret = pmb887x_flash_blk_pwrite(p->flash->blk, p->flash->offset + p->offset + offset, size, p->storage + offset);
 		if (ret < 0) {
-			flash_error_part(p, "Can't read to flash file: %d, %s", ret, strerror(ret));
+			pmb887x_flash_error_part(p, "Can't read to flash file: %d, %s", ret, strerror(ret));
 			exit(1);
 		}
 	}
 }
 
+// Command-mode reads/writes are delegated to the chip's command-set handler
+// (pmb887x_flash_cmd_ops_t). Read-Array reads never reach flash_io_read: the
+// region is in romd mode and served directly from storage.
 static uint64_t flash_io_read(void *opaque, hwaddr part_offset, unsigned size) {
 	pmb887x_flash_part_t *p = (pmb887x_flash_part_t *) opaque;
-	const pmb887x_flash_cfg_t *cfg = p->flash->cfg;
-	
-	hwaddr offset = p->offset + part_offset;
-	
-	uint16_t index;
-	uint32_t value = 0;
-	
-	switch (p->cmd) {
-		case 0x90:
-		case 0x98:
-			index = (offset >> 1) & 0xFFF;
-
-			// CFI
-			if (index >= CFI_ADDR && index < CFI_ADDR + cfg->cfi_size) {
-				value = cfg->cfi[index - CFI_ADDR];
-				flash_trace_part(p, "CFI %02X: %02X", index, value);
-			}
-			// PRI
-			else if (index >= cfg->pri_addr && index < cfg->pri_addr + cfg->pri_size) {
-				value = cfg->pri[index - cfg->pri_addr];
-				flash_trace_part(p, "PRI %02X: %02X", index - cfg->pri_addr, value);
-			}
-			// OTP0
-			else if (index >= cfg->otp0_addr && index < cfg->otp0_addr + (cfg->otp0_size / 2)) {
-				value = p->flash->otp0_data[index - cfg->otp0_addr];
-				flash_trace_part(p, "OTP0 %02X: %04X", index - cfg->otp0_addr, value);
-			}
-			// OTP1
-			else if (index >= cfg->otp1_addr && index < cfg->otp1_addr + (cfg->otp1_size / 2)) {
-				value = p->flash->otp1_data[index - cfg->otp1_addr];
-				flash_trace_part(p, "OTP1 %02X: %04X", index - cfg->otp1_addr, value);
-			}
-			// Other info
-			else {
-				switch (index) {
-					case 0x00:
-						value = p->flash->vid;
-						flash_trace_part(p, "vendor id: %04X", value);
-						break;
-
-					case 0x01:
-						value = p->flash->pid;
-						flash_trace_part(p, "device id: %04X", value);
-						break;
-
-					case 0x02: {
-						pmb887x_flash_block_t *blk = flash_part_find_block(p, offset);
-						value = blk->locked ? cfg->lock : 0;
-						flash_trace_part(p, "lock status: %02X", value);
-						break;
-					}
-
-					case 0x05:
-						value = cfg->cr;
-						flash_trace_part(p, "configuration register: %02X", value);
-						break;
-
-					case 0x06:
-						value = cfg->ehcr;
-						flash_trace_part(p, "enhanced configuration register: %02X", value);
-						break;
-
-					default:
-						value = 0xFFFF;
-						flash_error_part(p, "%08"PRIX64": read unknown cfi index 0x%02X", offset, index);
-						break;
-				}
-			}
-			break;
-
-		case 0x20:	// Erase
-		case 0x70:	// Status
-		case 0xe8:	// buffered program
-		case 0xE9:	// buffered program
-		case 0x41:	// program word
-		case 0x40:	// program word
-		case 0x10:	// program word
-			value = p->status;
-			// flash_trace_part(p, "%08"PRIX64": status 0x%02X", offset, value);
-			break;
-
-		case 0x94: {	// NAND-as-NOR NVRAM read-array: return stored array bytes
-			uint8_t *data = p->storage + (offset - p->offset);
-			switch (size) {
-				case 1:	value = data[0]; break;
-				case 2:	value = data[0] | (data[1] << 8); break;
-				default: value = data[0] | (data[1] << 8) | (data[2] << 16) | (data[3] << 24); break;
-			}
-			break;
-		}
-
-		default:
-			flash_error_part(p, "not implemented read for command %02X [addr: %08"PRIX64"]", p->cmd, offset);
-			exit(1);
-	}
-	
-	return value;
+	return p->cmd_ops->cmd_read(p, p->offset + part_offset, size);
 }
 
 static void flash_io_write(void *opaque, hwaddr part_offset, uint64_t value, unsigned size) {
 	pmb887x_flash_part_t *p = opaque;
-	
 	hwaddr offset = p->offset + part_offset;
-	
-	bool valid_cmd = false;
-	
-	if (p->wcycle == 0) {
-		memory_region_rom_device_set_romd(&p->mem, false);
-		
-		valid_cmd = true;
-		p->cmd_addr = offset;
 
-		// LG/APOXI firmware issues some setup commands with bit 2 set (0x64 = 0x60|4
-		// block-lock, 0x24 = 0x20|4 erase). No standard M18 setup command uses bit 2,
-		// so the chip ignores it; normalize before decoding. NOTE: 0x94 is NOT a
-		// read-id variant here - it is the NAND-as-NOR NVRAM read-array command
-		// (see case 0x94 below), so it is deliberately excluded.
-		if ((value & 0x04) && ((value & ~0x04u) == 0x60 || (value & ~0x04u) == 0x20))
-			value &= ~0x04u;
-
-		switch (value) {
-			case 0xFF:
-				flash_reset(p);
-				break;
-
-			case 0x00:
-			case 0xAA:
-			case 0x55:
-			case 0xF0:
-				flash_trace_part(p, "cmd AMD probe (%02"PRIX64")", value);
-				flash_reset(p);
-				break;
-
-			case 0x70:
-				flash_trace_part(p, "cmd read status (%02"PRIX64")", value);
-				p->cmd = value;
-				break;
-
-			case 0x90:
-				flash_trace_part(p, "cmd read devid (%02"PRIX64")", value);
-				p->cmd = value;
-				break;
-
-			case 0x94:
-				// NAND-as-NOR NVRAM read: the firmware's TCM flash routine primes the
-				// array with 0x94 before reading config/NVRAM bytes (0x70 -> 0x94 ->
-				// ldrb -> 0xFF). Return the stored array data via the io handler (a
-				// romd switch here doesn't take effect on the same-TB ldrb). Without
-				// this it was normalized to read-id 0x90 and every NVRAM byte read back
-				// 0xFFFF - the "read unknown cfi index" flood.
-				flash_trace_part(p, "cmd read array via 0x94 (%02"PRIX64")", value);
-				p->cmd = value;
-				break;
-
-			case 0x98:
-				flash_trace_part(p, "cmd read cfi (%02"PRIX64")", value);
-				p->cmd = value;
-				break;
-
-			case 0x50:
-				// Clear Status Register: single-cycle command. Reset the status bits to
-				// the default (ready) and stay in read-status mode; does not start a
-				// multi-cycle sequence.
-				flash_trace_part(p, "cmd clear status (%02"PRIX64")", value);
-				p->status = 0x80;
-				p->cmd = 0x70;
-				break;
-
-			case 0x41:
-			case 0x40:
-			case 0x10:
-				flash_trace_part(p, "cmd program word (%02"PRIX64")", value);
-				p->cmd = value;
-				p->wcycle++;
-				break;
-
-			case 0xE9:
-			case 0xE8:
-				flash_trace_part(p, "cmd buffered program (%02"PRIX64")", value);
-				p->cmd = value;
-				p->wcycle++;
-				p->status |= 0x80;
-				break;
-
-			case 0x80:
-				flash_trace_part(p, "cmd buffered EFP (%02"PRIX64")", value);
-				p->cmd = value;
-				p->wcycle++;
-				break;
-
-			case 0x20:
-				flash_trace_part(p, "cmd block erase (%02"PRIX64")", value);
-				p->cmd = value;
-				p->wcycle++;
-				p->status |= 0x80;
-				break;
-
-			case 0xB0:
-				flash_trace_part(p, "cmd suspend (%02"PRIX64")", value);
-				p->status |= 0x80 | 0x40 | 0x04;
-				p->cmd = 0x70;
-				break;
-
-			case 0xD0:
-				flash_trace_part(p, "cmd resume (%02"PRIX64")", value);
-				p->status |= 0x80;
-				p->status &= ~(0x40 | 0x04);
-				p->cmd = 0;
-				break;
-
-			case 0x60:
-				flash_trace_part(p, "cmd block lock or read configuration (%02"PRIX64")", value);
-				p->cmd = value;
-				p->wcycle++;
-				break;
-
-
-			case 0xC0:
-				flash_trace_part(p, "cmd protection program (%02"PRIX64")", value);
-				p->cmd = value;
-				p->wcycle++;
-				break;
-
-			default:
-				flash_trace_part(p, "cmd unknown (%02"PRIX64") at %08"PRIX64"", value, p->flash->offset + offset);
-				flash_reset(p);
-				// flash_error_part(p, "cmd unknown (%02"PRIX64") at %08"PRIX64"", value, p->flash->offset + offset);
-				// exit(1);
-				break;
-		}
-	} else if (p->wcycle == 1) {
-		switch (p->cmd) {
-			case 0x70:	// read status
-			case 0x90:	// read devid
-			case 0x98:	// read cfi
-				if (value == 0xFF) {
-					valid_cmd = true;
-					flash_reset(p);
-				}
-				break;
-			
-			case 0x60:	// lock or configuration
-				if (value == 0xFF) {
-					valid_cmd = true;
-					flash_reset(p);
-				} else if (value == 0x03) {
-					valid_cmd = true;
-					flash_trace_part(p, "program read configuration register (%02"PRIX64")", p->flash->offset + offset);
-					flash_reset(p);
-				} else if (value == 0x04) {
-					valid_cmd = true;
-					flash_trace_part(p, "program read enhanced configuration register (%02"PRIX64")", p->flash->offset + offset);
-					flash_reset(p);
-				} else if (value == 0x01) {
-					valid_cmd = true;
-					
-					flash_trace_part(p, "lock block %08"PRIX64"", p->flash->offset + offset);
-					pmb887x_flash_block_t *blk = flash_part_find_block(p, offset);
-					blk->locked = true;
-					
-					p->wcycle = 0;
-					p->status |= 0x80;
-				} else if (value == 0xD0) {
-					valid_cmd = true;
-					
-					flash_trace_part(p, "unlock block %08"PRIX64"", p->flash->offset + offset);
-					pmb887x_flash_block_t *blk = flash_part_find_block(p, offset);
-					blk->locked = false;
-					
-					p->wcycle = 0;
-					p->status |= 0x80;
-				} else if (value == 0x2F) {
-					valid_cmd = true;
-					flash_trace_part(p, "lock-down block %08"PRIX64"", p->flash->offset + offset);
-					p->wcycle = 0;
-					p->status |= 0x80;
-				}
-				break;
-			
-			case 0x20:	// erase
-				if (value == 0xD0) {
-					uint32_t sector_size = flash_find_sector_size(p, offset);
-					uint32_t mask = ~(sector_size - 1);
-					uint32_t base = (p->cmd_addr & mask);
-					
-					flash_trace_part(p, "confirm erase block %08X...%08X (sector: %08X)", p->flash->offset + base, p->flash->offset + base + sector_size - 1, sector_size);
-					
-					if ((offset & mask) != (p->cmd_addr & mask)) {
-						flash_error_part(p, "erase sector mismatch: %08"PRIX64" != %08X", p->flash->offset + offset, p->flash->offset + p->cmd_addr);
-						exit(1);
-					}
-					
-					// fill sector with 0xFF's
-					uint32_t erase_offset = (base - p->offset);
-					memset(p->storage + erase_offset, 0xFF, sector_size);
-					
-					if (pmb887x_flash_blk_is_rw(p->flash->blk)) {
-						int ret = pmb887x_flash_blk_pwrite(p->flash->blk, p->flash->offset + p->offset + erase_offset, sector_size, p->storage + erase_offset);
-						if (ret < 0) {
-							flash_error_part(p, "Can't read to flash file: %d, %s", ret, strerror(ret));
-							exit(1);
-						}
-					}
-					
-					valid_cmd = true;
-					p->wcycle = 0;
-					p->status |= 0x80;
-				}
-				break;
-			
-			case 0xE9:	// buffered program
-			case 0xE8:	// buffered program
-				valid_cmd = true;
-				p->buffer_size = (value & 0xFFFF) + 1;
-				p->buffer_index = 0;
-				p->buffer = g_new0(pmb887x_flash_buffer_t, p->buffer_size);
-				
-				flash_trace_part(p, "buffered program %d words", p->buffer_size);
-				
-				p->wcycle++;
-				break;
-			
-			case 0x10:	// program word
-			case 0x40:	// program word
-			case 0x41:	// program word
-				valid_cmd = true;
-				flash_trace_part(p, "program single word [%d]: %08"PRIX64" to %08"PRIX64"", size, value, p->flash->offset + offset);
-				flash_data_write(p, offset, value, size);
-				p->wcycle = 0;
-				p->status |= 0x80;
-				break;
-
-			case 0xC0: {	// program OTP / lock register
-				valid_cmd = true;
-				const pmb887x_flash_cfg_t *otp_cfg = p->flash->cfg;
-				uint16_t otp_index = (offset >> 1) & 0xFFF;
-				// OTP is one-time-programmable: programming only clears bits (AND).
-				if (otp_index >= otp_cfg->otp0_addr && otp_index < otp_cfg->otp0_addr + (otp_cfg->otp0_size / 2))
-					p->flash->otp0_data[otp_index - otp_cfg->otp0_addr] &= value;
-				else if (otp_index >= otp_cfg->otp1_addr && otp_index < otp_cfg->otp1_addr + (otp_cfg->otp1_size / 2))
-					p->flash->otp1_data[otp_index - otp_cfg->otp1_addr] &= value;
-				flash_trace_part(p, "program OTP/lock reg [%03X]: %04"PRIX64"", otp_index, value & 0xFFFF);
-				p->wcycle = 0;
-				p->status |= 0x80;
-				break;
-			}
-		}
-	} else if (p->wcycle == 2) {
-		switch (p->cmd) {
-			case 0xE9:	// buffered program
-			case 0xE8:	// buffered program
-			{
-				uint32_t sector_size = flash_find_sector_size(p, offset);
-				uint32_t mask = ~(sector_size - 1);
-				
-				valid_cmd = true;
-				
-				flash_trace_part(p, "program word [%d]: %08"PRIX64" to %08"PRIX64"", size, value, p->flash->offset + offset);
-				
-				if ((offset & mask) != (p->cmd_addr & mask)) {
-					flash_error_part(p, "program sector mismatch: %08"PRIX64" != %08X", offset, p->cmd_addr);
-				//	exit(1);
-				}
-				
-				if (size != 2 && size != 4) {
-					flash_error_part(p, "invalid write size: %d", size);
-					exit(1);
-				}
-				
-				for (int i = 0; i < size; i += 2) {
-					int overwrite_buffer_index = -1;
-					for (int j = 0; j < p->buffer_size; j++) {
-						if (p->buffer[j].offset == offset + i && p->buffer[j].size == 2) {
-							overwrite_buffer_index = j;
-							break;
-						}
-					}
-
-					if (overwrite_buffer_index >= 0) {
-						p->buffer[overwrite_buffer_index].value = (value >> (i * 8)) & 0xFFFF;
-					} else {
-						p->buffer[p->buffer_index].offset = offset + i;
-						p->buffer[p->buffer_index].value = (value >> (i * 8)) & 0xFFFF;
-						p->buffer[p->buffer_index].size = 2;
-						p->buffer_index++;
-					}
-
-					if (p->buffer_index == p->buffer_size)
-						break;
-				}
-
-				if (p->buffer_index == p->buffer_size) {
-					flash_trace_part(p, "buffered program finished");
-					p->wcycle++;
-				}
-				break;
-			}
-		}
-	} else if (p->wcycle == 3) {
-		switch (p->cmd) {
-			case 0xE9:	// buffered program
-			case 0xE8:	// buffered program
-				if (value == 0xD0) {
-					for (uint32_t i = 0; i < p->buffer_size; i++)
-						flash_data_write(p, p->buffer[i].offset, p->buffer[i].value, p->buffer[i].size);
-					
-					g_free(p->buffer);
-					p->buffer = NULL;
-					
-					valid_cmd = true;
-					flash_trace_part(p, "confirm buffered program");
-					p->wcycle = 0;
-					p->status |= 0x80;
-				}
-				break;
-		}
-	}
-	
-	if (!valid_cmd) {
-		flash_error_part(p, "not implemented %d cycle for command %02X [addr: %08"PRIX64", value: %08"PRIX64"]", p->wcycle, p->cmd, p->flash->offset + offset, value);
+	if (!p->cmd_ops->cmd_write(p, offset, value, size)) {
+		pmb887x_flash_error_part(p, "not implemented %d cycle for command %02X [addr: %08"PRIX64", value: %08"PRIX64"]", p->wcycle, p->cmd, p->flash->offset + offset, value);
 		exit(1);
 	}
 }
@@ -668,6 +191,7 @@ static void flash_init_part(pmb887x_flash_t *flash, const pmb887x_flash_cfg_part
 	p->offset = part_cfg->offset;
 	p->size = part_cfg->size;
 	p->cfg = part_cfg;
+	p->cmd_ops = flash->cmd_ops;
 	p->status = 0x80; // SR7 ready: power-up default per datasheet (0x0080)
 	
 	char *name = g_strdup_printf("pmb887x-flash[%s][%d]", p->flash->name, p->n);
@@ -677,15 +201,15 @@ static void flash_init_part(pmb887x_flash_t *flash, const pmb887x_flash_cfg_part
 	g_free(name);
 	
 	p->storage = memory_region_get_ram_ptr(&p->mem);
-	
-	flash_trace_part(p, "hw partition 0x%08X ... 0x%08X", p->flash->offset + p->offset, p->flash->offset + p->offset + p->size - 1);
+
+	pmb887x_flash_trace_part(p, "hw partition 0x%08X ... 0x%08X", p->flash->offset + p->offset, p->flash->offset + p->offset + p->size - 1);
 	
 	int ret = pmb887x_flash_blk_pread(p->flash->blk, flash->offset + p->offset, p->size, p->storage);
 	if (ret < 0) {
 		flash_error(p->flash, "failed to read the initial flash content [offset=%08X, size=%08X]", p->flash->offset + p->offset, p->size);
 		exit(1);
 	}
-	
+
 	p->blocks_n = 0;
 	for (uint32_t i = 0; i < p->cfg->erase_regions_cnt; i++)
 		p->blocks_n += p->cfg->erase_regions[i].size / p->cfg->erase_regions[i].sector;
@@ -720,8 +244,9 @@ static void flash_realize(DeviceState *dev, Error **errp) {
 	
 	flash->cfg = cfg;
 	flash->size = cfg->size;
-	
-	flash_trace(flash, "FLASH %04X:%04X, 0x%08X ... 0x%08X", flash->vid, flash->pid, flash->offset, flash->offset + flash->size - 1);
+	flash->cmd_ops = pmb887x_flash_cmd_ops_for(flash->vid, flash->pid);
+
+	flash_trace(flash, "FLASH %04X:%04X, 0x%08X ... 0x%08X [cmds: %s]", flash->vid, flash->pid, flash->offset, flash->offset + flash->size - 1, flash->cmd_ops->name);
 	
 	char *mmio_name = g_strdup_printf("pmb887x-flash[%s]", flash->name);
 	memory_region_init(&flash->mmio, OBJECT(flash->dev), mmio_name, flash->size);
@@ -769,18 +294,18 @@ static void flash_error(pmb887x_flash_t *flash, const char *format, ...) {
 	error_report("[%s] %s %s", PMB887X_TRACE_PREFIX, flash->name, s->str);
 }
 
-static void flash_error_part(pmb887x_flash_part_t *p, const char *format, ...) {
+void pmb887x_flash_error_part(pmb887x_flash_part_t *p, const char *format, ...) {
 	g_autoptr(GString) s = g_string_new("");
-	
+
 	va_list args;
 	va_start(args, format);
 	g_string_append_vprintf(s, format, args);
 	va_end(args);
-	
+
 	error_report("[%s] %s <%d> %s", PMB887X_TRACE_PREFIX, p->flash->name, p->n, s->str);
 }
 
-static void flash_trace_part(pmb887x_flash_part_t *p, const char *format, ...) {
+void pmb887x_flash_trace_part(pmb887x_flash_part_t *p, const char *format, ...) {
 	if (!pmb887x_trace_log_enabled(PMB887X_TRACE_FLASH))
 		return;
 	

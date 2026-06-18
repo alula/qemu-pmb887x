@@ -78,6 +78,7 @@ struct pmb887x_dif_t {
 	bool in_schedule;
 
 	bool fifo_req;
+	bool dma_tx_cont;	// DMAC-flow-controlled continuous TX (no peripheral transfer count)
 	uint32_t tx_remaining;
 	uint32_t rx_remaining;
 
@@ -262,6 +263,17 @@ static void dif_fifo_req(pmb887x_dif_t *p) {
 		uint32_t single_req_size = (4 / dif_get_tx_align(p));
 		uint32_t burst_req_count = burst_req_size / single_req_size;
 
+		if (p->dma_tx_cont) {
+			// DMAC-flow-controlled TX: the DMAC owns the count and writes its
+			// burst word-by-word (each TXD write drains synchronously to the LCD),
+			// so request whenever the FIFO has any room rather than a full burst.
+			if (pmb887x_fifo_free_count(p->tx_fifo) >= 1) {
+				pmb887x_srb_set_isr(&p->srb, DIFv2_ISR_TXBREQ);
+				p->fifo_req = true;
+			}
+			return;
+		}
+
 		uint32_t tx_remaining = p->tx_remaining - MIN(p->tx_remaining, pmb887x_fifo_count(p->tx_fifo) * single_req_size);
 		if (!tx_remaining)
 			return;
@@ -284,7 +296,7 @@ static void dif_fifo_req(pmb887x_dif_t *p) {
 			p->fifo_req = true;
 		} else {
 			if (pmb887x_fifo_free_count(p->tx_fifo) >= burst_req_size) {
-				pmb887x_srb_set_isr(&p->srb, I2Cv2_ISR_BREQ_INT);
+				pmb887x_srb_set_isr(&p->srb, DIFv2_ISR_TXBREQ);
 				p->fifo_req = true;
 			}
 		}
@@ -324,6 +336,7 @@ static void dif_fifo_clr_req(pmb887x_dif_t *p) {
 
 static void dif_kernel_reset(pmb887x_dif_t *p, uint32_t new_state) {
 	p->state = new_state;
+	p->dma_tx_cont = false;
 	p->tx_remaining = 0;
 	p->rx_remaining = 0;
 	p->rx_total_bytes = 0;
@@ -414,6 +427,35 @@ static void dif_start_tx(pmb887x_dif_t *p) {
 	dif_fifo_req(p);
 }
 
+// DMAC-flow-controlled continuous TX: started when RUN + a TX DMA request is
+// enabled (DIF_DMAE) without a peripheral transfer count (DIF_TPS_CTRL). Used by
+// the LG GDD/GTL display blit (DMAC channel = MEM2PER, framebuffer -> DIF_TXD).
+static void dif_start_dma_tx(pmb887x_dif_t *p) {
+	if (!dif_is_running(p) || p->state != DIF_STATE_NONE)
+		return;
+
+	uint32_t dmae = pmb887x_srb_get_dmae(&p->srb);
+	uint32_t tx_dma = DIFv2_DMAE_TXBREQ | DIFv2_DMAE_TXSREQ | DIFv2_DMAE_TXLBREQ | DIFv2_DMAE_TXLSREQ;
+	if (!(dmae & tx_dma) || p->tps_ctrl)
+		return;
+
+	DPRINTF("new transfer: dma-flow tx\n");
+	// Enter continuous DMA-TX atomically: set state + flag together so the
+	// re-arm path (dif_event_handler, state==TX) keeps the burst cycle going,
+	// and dif_work does not self-terminate. (Don't use dif_kernel_reset here -
+	// its dif_schedule would run dif_work with dma_tx_cont still false and
+	// immediately reset back to NONE.)
+	p->state = DIF_STATE_TX;
+	p->tx_remaining = 0;
+	p->rx_remaining = 0;
+	p->rx_total_bytes = 0;
+	p->rx_bytes_in_fifo = 0;
+	p->dma_tx_cont = true;
+	dif_fifo_clr_req(p);
+	dif_update_gpio_state(p);
+	dif_fifo_req(p);
+}
+
 static void dif_start_rx(pmb887x_dif_t *p) {
 	if (!dif_is_running(p) || p->state != DIF_STATE_NONE)
 		return;
@@ -482,11 +524,17 @@ static void dif_work(pmb887x_dif_t *p) {
 		}
 	} else if (p->state == DIF_STATE_TX) {
 		dif_tx_from_fifo(p);
-		dif_fifo_req(p);
 
-		if (p->tx_remaining == 0) {
-			DPRINTF("transfer done\n");
-			dif_kernel_reset(p, DIF_STATE_NONE);
+		// DMAC-flow-controlled TX: do NOT re-request here (mid-burst, per drained
+		// word) - that thrashes one DMA request per 4-byte write. Re-arm happens
+		// once per burst on the DMAC's CLR (dif_handle_dmac_tx_clr). The DMAC ends
+		// the whole transfer with its TC IRQ.
+		if (!p->dma_tx_cont) {
+			dif_fifo_req(p);
+			if (p->tx_remaining == 0) {
+				DPRINTF("transfer done\n");
+				dif_kernel_reset(p, DIF_STATE_NONE);
+			}
 		}
 	} else if (p->state == DIF_STATE_RX) {
 		hw_error("DIF: RX is not supported!");
@@ -756,6 +804,8 @@ static void dif_io_write(void *opaque, hwaddr haddr, uint64_t value, unsigned si
 				dif_kernel_reset(p, DIF_STATE_NONE);
 				pmb887x_fifo_reset(p->tx_fifo);
 				pmb887x_fifo_reset(p->rx_fifo);
+			} else if (p->runctrl) {
+				dif_start_dma_tx(p);
 			}
 			break;
 
@@ -888,6 +938,7 @@ static void dif_io_write(void *opaque, hwaddr haddr, uint64_t value, unsigned si
 		case DIFv2_DMAE:
 			pmb887x_srb_set_dmae(&p->srb, value);
 			dif_trigger_dma(p);
+			dif_start_dma_tx(p);
 			break;
 
 		case DIFv2_TXD ... (DIFv2_TXD + FIFO_IO_SIZE):
@@ -922,6 +973,26 @@ static void dif_handle_dmac_tx_clr(void *opaque, int id, int level) {
 	if (level == 1)
 		pmb887x_srb_set_icr(&p->srb, DIFv2_ICR_TXSREQ | DIFv2_ICR_TXBREQ | DIFv2_ICR_TXLSREQ | DIFv2_ICR_TXLBREQ);
 	dif_trigger_dma(p);
+
+	// Continuous DMA-TX: re-arm the burst request only AFTER the DMAC's CLR has
+	// fully deasserted, otherwise the re-request races with the set_icr above
+	// (which clears it again) and the cycle dies after one burst.
+	if (level == 0 && p->dma_tx_cont && p->state == DIF_STATE_TX) {
+		dif_fifo_clr_req(p);
+		dif_fifo_req(p);
+	}
+}
+
+static void dif_handle_dmac_tx_tc(void *opaque, int id, int level) {
+	pmb887x_dif_t *p = opaque;
+	// DMAC terminal count: the flow-controlled TX transfer is complete. Return
+	// the DIF to idle so DIF_STAT.BSY (state != NONE) clears - the firmware polls
+	// it before starting the next scanline blit. Without this only one line draws.
+	if (level && p->dma_tx_cont) {
+		pmb887x_srb_set_icr(&p->srb, DIFv2_ICR_TXSREQ | DIFv2_ICR_TXBREQ | DIFv2_ICR_TXLSREQ | DIFv2_ICR_TXLBREQ);
+		dif_kernel_reset(p, DIF_STATE_NONE);
+		dif_trigger_dma(p);
+	}
 }
 
 static void dif_handle_dmac_rx_clr(void *opaque, int id, int level) {
@@ -956,7 +1027,9 @@ static int dif_irq_router(void *opaque, int event_id) {
 static void dif_event_handler(void *opaque, int event_id, int level) {
 	pmb887x_dif_t *p = opaque;
 	uint32_t mask = 1 << event_id;
-	if (level == 0 && (mask & FIFO_ICR_MASK) != 0) {
+	// Continuous DMA-TX re-arms once per burst on the DMAC CLR, not here (this
+	// fires per drained word and would thrash one DMA request per 4-byte write).
+	if (level == 0 && (mask & FIFO_ICR_MASK) != 0 && !p->dma_tx_cont) {
 		if (p->state == DIF_STATE_RX || p->state == DIF_STATE_TX) {
 			dif_fifo_clr_req(p);
 			dif_fifo_req(p);
@@ -979,6 +1052,7 @@ static void dif_init(Object *obj) {
 
 	// DMAC
 	qdev_init_gpio_in_named(dev, dif_handle_dmac_tx_clr, "DMAC_TX_CLR", 1);
+	qdev_init_gpio_in_named(dev, dif_handle_dmac_tx_tc, "DMAC_TX_TC", 1);
 	qdev_init_gpio_out_named(dev, &p->dmac_tx_sreq, "DMAC_TX_SREQ", 1);
 	qdev_init_gpio_out_named(dev, &p->dmac_tx_breq, "DMAC_TX_BREQ", 1);
 	qdev_init_gpio_out_named(dev, &p->dmac_tx_lsreq, "DMAC_TX_LSREQ", 1);

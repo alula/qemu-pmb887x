@@ -49,6 +49,10 @@ struct pmb887x_keypad_t {
 	uint32_t *map;
 	uint32_t map_size;
 
+	// Matrix bits (in: bits 0-7, out: bits 8+) of a key held down at power-on, so
+	// the firmware sees a power/END-key boot cause (KE970: END key KP_OUT1/KP_IN5).
+	uint32_t poweron_matrix;
+
 	qemu_irq gpio_out[4];
 };
 
@@ -218,12 +222,33 @@ static void keypad_realize(DeviceState *dev, Error **errp) {
 			hw_error("pmb887x-keypad: irq %d not set", i);
 		pmb887x_src_init(&p->src[i], p->irq[i]);
 	}
-	
+
     qemu_input_handler_register(dev, &keypad_input_handler);
+
+	// Hold the configured power-on key down so the firmware detects a power/END-key
+	// boot (otherwise it falls back to a charger-detect startup cause and never
+	// reaches the normal desktop).
+	if (p->poweron_matrix) {
+		bool any = false;
+		for (int i = 0; i < KEYPAD_MAX_OUT; i++) {
+			if (!(p->poweron_matrix & (1 << (8 + i))))
+				continue;
+			for (int j = 0; j < KEYPAD_MAX_IN; j++) {
+				if (!(p->poweron_matrix & (1 << j)))
+					continue;
+				p->state[i][j]++;
+				p->port[i / 4] &= ~((1 << j) << ((i % 4) * 8));
+				any = true;
+			}
+		}
+		if (any)
+			pmb887x_src_update(&p->src[IRQ_KEY_PRESS], 0, MOD_SRC_SETR);
+	}
 }
 
 static const Property keypad_properties[] = {
 	DEFINE_PROP_ARRAY("map", pmb887x_keypad_t, map_size, map, qdev_prop_uint32, uint32_t),
+	DEFINE_PROP_UINT32("poweron_matrix", pmb887x_keypad_t, poweron_matrix, 0),
 };
 
 static void keypad_class_init(ObjectClass *klass, const void *data) {

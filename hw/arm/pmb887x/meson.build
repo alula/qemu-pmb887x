@@ -2,6 +2,7 @@ arm_common_ss.add(when: 'CONFIG_PMB887X', if_true: files(
 	'board.c',
 	'fifo.c',
 	'flash.c',
+	'flash-numonyx.c',
 	'flash-blk.c',
 	'adc.c',
 	'ebu.c',
@@ -61,5 +62,6 @@ arm_common_ss.add(when: 'CONFIG_PMB887X', if_true: files(
 
 	'i2c/d1094xx.c',
 	'i2c/pmb6812.c',
+	'i2c/lm4946.c',
 	'i2c/tea5761uk.c',
 ))

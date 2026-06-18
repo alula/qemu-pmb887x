@@ -235,6 +235,7 @@ static void pmb887x_init(MachineState *machine) {
 	// KEYPAD
 	DeviceState *keypad = pmb887x_new_cpu_module("KEYPAD");
 	pmb887x_init_keymap(keypad, pmb887x_board()->keymap, Q_KEY_CODE__MAX);
+	qdev_prop_set_uint32(keypad, "poweron_matrix", pmb887x_board()->poweron_matrix);
 	sysbus_realize_and_unref(SYS_BUS_DEVICE(keypad), &error_fatal);
 
 	// External Bus Unit

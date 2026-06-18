@@ -80,6 +80,7 @@ struct pmb887x_gptu_timer_t2_t {
 	bool oneshot;
 	bool count_down;
 	bool stopped;
+	bool reload_mode;	// T2RCCON reload-on-overflow: reload counter from T2RCx, not 0
 	uint64_t start;
 	int64_t counter;
 	int64_t reload;
@@ -209,6 +210,15 @@ static int64_t gptu_t2_reload_counter(pmb887x_gptu_timer_t2_t *timer, int64_t co
 	if (gptu_t2_is_ouv(timer, counter)) {
 		if (timer->oneshot)
 			return timer->count_down ? timer->reload : 0;
+		// Reload-on-overflow mode (T2RCCON): on wrap, reload the counter from the
+		// reload register (T2RCx) instead of from 0 / full range, so the period is
+		// (overflow - reload) repeatedly. Without this an up-counter set up for a
+		// short reload delay restarts from ~0 and takes the full 2^32 ticks.
+		if (timer->reload_mode) {
+			return timer->count_down ?
+				(timer->reload + counter) :	// counter<0 on underflow -> reload - |carry|
+				(timer->reload + (counter % timer->overflow));
+		}
 		return timer->count_down ?
 			(timer->reload - (counter % timer->overflow)) :
 			(counter % timer->overflow);
@@ -288,6 +298,7 @@ static void gptu_t2_update_state(pmb887x_gptu_t *p) {
 		for (int i = 0; i < 2; i++) {
 			p->timers_t2[i].reload = 0xFFFF;
 			p->timers_t2[i].overflow = 0x10000;
+			p->timers_t2[i].reload_mode = false;
 		}
 		
 		p->timers_t2[0].enabled = (p->t012run & GPTU_T012RUN_T2ARUN) != 0;
@@ -308,8 +319,12 @@ static void gptu_t2_update_state(pmb887x_gptu_t *p) {
 		p->timers_t2[0].reload = 0xFFFF;
 		p->timers_t2[0].overflow = 0x10000;
 		p->timers_t2[0].enabled = false;
-		
-		p->timers_t2[1].reload = 0xFFFFFFFF;
+		p->timers_t2[0].reload_mode = false;
+
+		// T2A (32-bit) reload-on-overflow: T2RCCON.T2AMRC0 modes 4..7 reload from T2RC0.
+		uint32_t t2amrc0 = (p->t2rccon & GPTU_T2RCCON_T2AMRC0) >> GPTU_T2RCCON_T2AMRC0_SHIFT;
+		p->timers_t2[1].reload_mode = (t2amrc0 & 4) != 0;
+		p->timers_t2[1].reload = p->timers_t2[1].reload_mode ? (uint32_t) p->t2rc0 : 0xFFFFFFFF;
 		p->timers_t2[1].overflow = 0x100000000;
 		p->timers_t2[1].oneshot = (p->t2con & GPTU_T2CON_T2ACOS) != 0;
 		p->timers_t2[1].enabled = (p->t012run & GPTU_T012RUN_T2ARUN) != 0;
