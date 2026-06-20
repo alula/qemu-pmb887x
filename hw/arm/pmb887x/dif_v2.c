@@ -28,6 +28,15 @@
 
 #define FIFO_IO_SIZE	0x3FFF
 #define FIFO_SIZE		16
+
+/*
+ * Semihosting debug print port (DIF base + 0xF0).
+ * Reserved/unmapped on real hardware (no-op), so firmware patches can write
+ * to it for printf-style tracing under the emulator. Byte writes are buffered
+ * into a line and flushed on '\n' (or buffer-full); word writes print the
+ * 32-bit value as hex immediately. Absolute address on KE970: 0xF71000F0.
+ */
+#define DIFv2_DEBUG_PUTC	0xF0
 #define FIFO_ICR_MASK	( \
 	DIFv2_ICR_RXLSREQ | DIFv2_ICR_RXSREQ | \
 	DIFv2_ICR_RXLBREQ | DIFv2_ICR_RXBREQ | \
@@ -135,6 +144,10 @@ struct pmb887x_dif_t {
 
 	int dmac_tx_clr;
 	int dmac_rx_clr;
+
+	// Semihosting debug print port (no-op reg on real HW); see DIFv2_DEBUG_PUTC.
+	char dbg_line[256];
+	unsigned dbg_len;
 
 	qemu_irq dmac_tx_breq;
 	qemu_irq dmac_tx_sreq;
@@ -773,6 +786,10 @@ static uint64_t dif_io_read(void *opaque, hwaddr haddr, unsigned size) {
 			value = 0;
 			break;
 
+		case DIFv2_DEBUG_PUTC:
+			value = 0;
+			break;
+
 		case DIFv2_RXD ... (DIFv2_RXD + FIFO_IO_SIZE):
 			dif_fifo_read(p, &value);
 			break;
@@ -943,6 +960,25 @@ static void dif_io_write(void *opaque, hwaddr haddr, uint64_t value, unsigned si
 
 		case DIFv2_TXD ... (DIFv2_TXD + FIFO_IO_SIZE):
 			dif_fifo_write(p, value);
+			break;
+
+		case DIFv2_DEBUG_PUTC:
+			if (size == 1) {
+				uint8_t c = value & 0xFF;
+				if (c == '\n' || p->dbg_len >= sizeof(p->dbg_line) - 1) {
+					p->dbg_line[p->dbg_len] = '\0';
+					printf("[pmb887x-semihost] %s\n", p->dbg_line);
+					fflush(stdout);
+					p->dbg_len = 0;
+					if (c != '\n' && c != '\0')
+						p->dbg_line[p->dbg_len++] = c;
+				} else if (c != '\0') {
+					p->dbg_line[p->dbg_len++] = c;
+				}
+			} else {
+				printf("[pmb887x-semihost] 0x%08"PRIX64"\n", value);
+				fflush(stdout);
+			}
 			break;
 
 		default:

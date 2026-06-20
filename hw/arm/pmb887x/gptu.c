@@ -409,8 +409,12 @@ static void gptu_sync_timer(pmb887x_gptu_t *p) {
 	
 	int64_t now = qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL);
 	p->next = now + p->freq;
-	
-	for (int i = p->from; i < p->to; i++) {
+
+	// p->to is the index of the LAST timer in the active chain (set as "p->to = i"
+	// in gptu_rebuild_timers), so the range is inclusive. Using "i < p->to" dropped
+	// the last timer, which is the high word of a concat counter and the SSR source
+	// for its overflow IRQ - e.g. the Nucleus OS-tick on GPTU0 T1D (SSR10 -> SRC6).
+	for (int i = p->from; i <= p->to; i++) {
 		int timer_id = i % 8;
 		pmb887x_gptu_timer_t *timer = &p->timers[timer_id];
 		
