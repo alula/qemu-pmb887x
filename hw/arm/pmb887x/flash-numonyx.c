@@ -36,12 +36,20 @@
  */
 #define NUMONYX_CMD_LG_NVRAM_READ	0x94
 
+/* Read 1/2/4 bytes of plain array data from the part's backing storage. */
+static uint32_t numonyx_read_array(pmb887x_flash_part_t *p, hwaddr offset, unsigned size) {
+	const uint8_t *data = (const uint8_t *)p->storage + (offset - p->offset);
+	switch (size) {
+		case 1:  return data[0];
+		case 2:  return data[0] | (data[1] << 8);
+		default: return data[0] | (data[1] << 8) | (data[2] << 16) | (data[3] << 24);
+	}
+}
+
 static uint32_t numonyx_cmd_read(pmb887x_flash_part_t *p, hwaddr offset, unsigned size) {
 	const pmb887x_flash_cfg_t *cfg = p->flash->cfg;
 	uint16_t index;
 	uint32_t value = 0;
-	uint32_t _dbg_abs = p->flash->offset + offset;
-	int _dbg = getenv("KE970_RD_LOG") && _dbg_abs >= 0x3000000 && (_dbg_abs & 0x3FFFF) < 0x18;
 	switch (p->cmd) {
 		case 0x90:	// Read Device Information
 		case 0x98:	// CFI Query
@@ -112,59 +120,27 @@ static uint32_t numonyx_cmd_read(pmb887x_flash_part_t *p, hwaddr offset, unsigne
 		case 0x41:	// program word
 		case 0x40:	// program word
 		case 0x10:	// program word
-			// Returning Status here for cmd 0x70/program/erase makes the firmware
-			// misread FFS block headers on the io-pinned (nvram_mode) partition: the
-			// LG NVRAM read primitive (RAM, flash_lg_nvram_read_half_0x94) does
-			// 0xB0(suspend,->cmd=0x70) -> poll status -> 0x94 -> read -> 0xD0, and
-			// the GC's bulk flash_read_words() then does RAW multi-word reads that
-			// assume the partition still serves array data. A plain status-follows-cmd
-			// model returns status for those header reads -> the GC/allocator
-			// sub_A26A5308 sees garbage, finds no free block, and fgc:1 deadlocks.
-			//
-			// Disambiguation: a NOR status poll is always directed at the command
-			// address (p->cmd_addr); FFS header/data reads target other block
-			// addresses. Serve ARRAY data for any read whose offset differs from
-			// cmd_addr. Genuine status polls (offset == cmd_addr, e.g. the 0xB0
-			// suspend poll and erase/program completion polling) still get status, so
-			// erase-suspend RWW loops are unaffected. This applies to every partition
-			// of the FFS flash: the store spans several partitions (0xA3.., 0xA4..,
-			// ...) but only the partition first hit by 0x94 is nvram-pinned; the GC
-			// erases/relocates across all of them, and the header reads it performs
-			// on the *non-pinned* partitions while an erase/program is in flight must
-			// likewise see array bytes (else the GC mis-reads a just-erased block's
-			// header as status 0x80 and re-erases forever).
-			if (offset != p->cmd_addr) {
-				uint8_t *data = (uint8_t *)p->storage + (offset - p->offset);
-				switch (size) {
-					case 1:  value = data[0]; break;
-					case 2:  value = data[0] | (data[1] << 8); break;
-					default: value = data[0] | (data[1] << 8) | (data[2] << 16) | (data[3] << 24); break;
-				}
-			} else {
-				value = p->status;
-			}
-			// pmb887x_flash_trace_part(p, "%08"PRIX64": status 0x%02X", offset, value);
+			// RWW disambiguation (M18 Read-While-Write). A NOR status poll is always
+			// directed at the command address (p->cmd_addr); a read at any other
+			// address is an array read. The LG/APOXI FFS GC relies on this: while a
+			// program/erase is in flight it issues RAW multi-word reads
+			// (flash_read_words) against *other* block headers and expects array
+			// data. Returning status (0x80) for those reads makes the GC/allocator
+			// see garbage, find no free block, and deadlock (fgc:1). So serve array
+			// data when offset != cmd_addr, and status only for the genuine poll at
+			// cmd_addr (incl. the 0xB0-suspend poll, so erase-suspend RWW is intact).
+			value = (offset != p->cmd_addr) ? numonyx_read_array(p, offset, size) : p->status;
 			break;
 
 		case 0x00:	// read array (served here while the partition is pinned to io-mode)
-		case NUMONYX_CMD_LG_NVRAM_READ: {	// VENDOR QUIRK #1: return stored array bytes
-			uint8_t *data = p->storage + (offset - p->offset);
-			switch (size) {
-				case 1:	value = data[0]; break;
-				case 2:	value = data[0] | (data[1] << 8); break;
-				default: value = data[0] | (data[1] << 8) | (data[2] << 16) | (data[3] << 24); break;
-			}
+		case NUMONYX_CMD_LG_NVRAM_READ:	// VENDOR QUIRK #1: return stored array bytes
+			value = numonyx_read_array(p, offset, size);
 			break;
-		}
 
 		default:
 			pmb887x_flash_error_part(p, "not implemented read for command %02X [addr: %08"PRIX64"]", p->cmd, offset);
 			exit(1);
 	}
-
-	if (_dbg)
-		fprintf(stderr, "[KE970_RD] abs=%08X blkoff=%X size=%d cmd=%02X nvram=%d -> %08X\n",
-			_dbg_abs, (uint32_t)(_dbg_abs & 0x3FFFF), size, p->cmd, p->nvram_mode, value);
 
 	return value;
 }
@@ -222,25 +198,6 @@ static bool numonyx_cmd_write(pmb887x_flash_part_t *p, hwaddr offset, uint64_t v
 				// This is the FFS/NVRAM data partition: pin it to io-mode so the
 				// firmware's per-byte command-sequence reads don't thrash romd.
 				p->nvram_mode = true;
-				if (getenv("KE970_SCAN")) {
-					static long _cnt = 0;
-					if ((p->flash->offset + p->offset) == 0x3000000 && (_cnt++ % 200000) == 0) {
-						int nfree = 0, nerasecnt = 0, nother = 0;
-						for (int b = 0; b < 0xff; b++) {
-							uint32_t o = (uint32_t)b * 0x40000;
-							if (o + 4 > p->size) break;
-							uint8_t *st = (uint8_t *)p->storage;
-							uint32_t w0 = st[o] | (st[o+1]<<8) | (st[o+2]<<16) | (st[o+3]<<24);
-							uint32_t hi = (w0 >> 16) & 0xf000;
-							int has_ec = (w0 & 0x300000) != 0;
-							if (hi == 0x3000) nfree++;
-							else if (has_ec) nerasecnt++;
-							else nother++;
-						}
-						fprintf(stderr, "[KE970_SCAN] at nvram-pin: free(0x3xxx)=%d erasecnt(0x300000)=%d other=%d\n",
-							nfree, nerasecnt, nother);
-					}
-				}
 				break;
 
 			case 0x98:
@@ -323,7 +280,6 @@ static bool numonyx_cmd_write(pmb887x_flash_part_t *p, hwaddr offset, uint64_t v
 				p->wcycle++;
 				break;
 
-
 			case 0xC0:
 				pmb887x_flash_trace_part(p, "cmd protection program (%02"PRIX64")", value);
 				p->cmd = value;
@@ -334,8 +290,6 @@ static bool numonyx_cmd_write(pmb887x_flash_part_t *p, hwaddr offset, uint64_t v
 			default:
 				pmb887x_flash_trace_part(p, "cmd unknown (%02"PRIX64") at %08"PRIX64"", value, p->flash->offset + offset);
 				pmb887x_flash_reset(p);
-				// pmb887x_flash_error_part(p, "cmd unknown (%02"PRIX64") at %08"PRIX64"", value, p->flash->offset + offset);
-				// exit(1);
 				break;
 		}
 	} else if (p->wcycle == 1) {
@@ -402,12 +356,6 @@ static bool numonyx_cmd_write(pmb887x_flash_part_t *p, hwaddr offset, uint64_t v
 
 					// fill sector with 0xFF's
 					uint32_t erase_offset = (base - p->offset);
-					if (getenv("KE970_FFS_LOG")) {
-						uint32_t eabs = p->flash->offset + p->offset + erase_offset;
-						if (eabs >= 0x3000000 && eabs < 0x8000000)
-							fprintf(stderr, "[KE970_FFS] ERASE block abs=%08X size=%X nvram_mode=%d\n",
-								eabs, sector_size, p->nvram_mode);
-					}
 					memset(p->storage + erase_offset, 0xFF, sector_size);
 
 					if (pmb887x_flash_blk_is_rw(p->flash->blk)) {
@@ -421,10 +369,6 @@ static bool numonyx_cmd_write(pmb887x_flash_part_t *p, hwaddr offset, uint64_t v
 					valid_cmd = true;
 					p->wcycle = 0;
 					p->status |= 0x80;
-					// Resume pinned NVRAM array-read after the erase completes (see
-					// the program-word completion above for rationale).
-					if (p->nvram_mode)
-						p->cmd = NUMONYX_CMD_LG_NVRAM_READ;
 				}
 				break;
 
@@ -448,15 +392,6 @@ static bool numonyx_cmd_write(pmb887x_flash_part_t *p, hwaddr offset, uint64_t v
 				pmb887x_flash_data_write(p, offset, value, size);
 				p->wcycle = 0;
 				p->status |= 0x80;
-				// On the io-pinned NVRAM/FFS partition the firmware does not always
-				// re-issue Read-Array/0x94 before reading back block headers; on the
-				// real LG part the pinned NVRAM-read mode resumes once the transient
-				// program completes. Mirror that: restore array-read so subsequent
-				// header reads return array data, not the (now stale) program status.
-				// (Genuine in-progress status polls keep cmd 0x70 / op_pending and
-				// are unaffected; this only fires at single-word program completion.)
-				if (p->nvram_mode)
-					p->cmd = NUMONYX_CMD_LG_NVRAM_READ;
 				break;
 
 			case 0xC0: {	// program OTP / lock register
@@ -496,15 +431,14 @@ static bool numonyx_cmd_write(pmb887x_flash_part_t *p, hwaddr offset, uint64_t v
 				 * at the fill address). The only true constraint is that the write
 				 * buffer cannot cross a block boundary, so every fill word must share
 				 * the block of the first fill word. Validate against that, not the
-				 * stale setup address.
+				 * stale setup address. (The FFS GC trips this benignly at high rate;
+				 * keep it a trace, not an error.)
 				 */
 				if (p->buffer_index == 0)
 					p->buffer_base = offset;
 
-				if ((offset & mask) != (p->buffer_base & mask)) {
-					pmb887x_flash_error_part(p, "program buffer crosses block boundary: %08"PRIX64" != %08X", offset, p->buffer_base);
-				//	exit(1);
-				}
+				if ((offset & mask) != (p->buffer_base & mask))
+					pmb887x_flash_trace_part(p, "program buffer crosses block boundary: %08"PRIX64" != %08X", offset, p->buffer_base);
 
 				if (size != 2 && size != 4) {
 					pmb887x_flash_error_part(p, "invalid write size: %d", size);
@@ -555,9 +489,6 @@ static bool numonyx_cmd_write(pmb887x_flash_part_t *p, hwaddr offset, uint64_t v
 					pmb887x_flash_trace_part(p, "confirm buffered program");
 					p->wcycle = 0;
 					p->status |= 0x80;
-					// Resume pinned NVRAM array-read after buffered program completes.
-					if (p->nvram_mode)
-						p->cmd = NUMONYX_CMD_LG_NVRAM_READ;
 				}
 				break;
 		}

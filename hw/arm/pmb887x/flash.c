@@ -94,19 +94,6 @@ void pmb887x_flash_data_write(pmb887x_flash_part_t *p, uint32_t offset, uint32_t
 			exit(1);
 	}
 
-	if (getenv("KE970_FFS_LOG")) {
-		uint32_t abs = p->flash->offset + p->offset + offset;
-		if (abs >= 0x3000000 && abs < 0x8000000) {
-			uint32_t blkoff = abs & 0x3FFFF;
-			if (blkoff == 2 && size == 2) {
-				// 'offset' here is already partition-relative (post p->offset subtraction)
-				uint16_t result = data[offset] | (data[offset + 1] << 8);
-				fprintf(stderr, "[KE970_FFS] HDR+2 program block %08X reqval=%04X stored=%04X topnib=%X\n",
-					abs & ~0x3FFFFu, (uint16_t)value, result, (result >> 12) & 0xF);
-			}
-		}
-	}
-
 	if (pmb887x_flash_blk_is_rw(p->flash->blk)) {
 		int ret = pmb887x_flash_blk_pwrite(p->flash->blk, p->flash->offset + p->offset + offset, size, p->storage + offset);
 		if (ret < 0) {
