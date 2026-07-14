@@ -81,6 +81,7 @@ struct pmb887x_dif_t {
 	qemu_irq gpio_cd;
 	qemu_irq gpio_wr;
 	qemu_irq gpio_rd;
+	qemu_irq gpio_vd;
 
 	QEMUTimer *timer;
 	bool transfer_pending;
@@ -88,6 +89,7 @@ struct pmb887x_dif_t {
 
 	bool fifo_req;
 	bool dma_tx_cont;	// DMAC-flow-controlled continuous TX (no peripheral transfer count)
+	bool vsync_pulse;
 	uint32_t tx_remaining;
 	uint32_t rx_remaining;
 
@@ -440,9 +442,6 @@ static void dif_start_tx(pmb887x_dif_t *p) {
 	dif_fifo_req(p);
 }
 
-// DMAC-flow-controlled continuous TX: started when RUN + a TX DMA request is
-// enabled (DIF_DMAE) without a peripheral transfer count (DIF_TPS_CTRL). Used by
-// the LG GDD/GTL display blit (DMAC channel = MEM2PER, framebuffer -> DIF_TXD).
 static void dif_start_dma_tx(pmb887x_dif_t *p) {
 	if (!dif_is_running(p) || p->state != DIF_STATE_NONE)
 		return;
@@ -453,11 +452,6 @@ static void dif_start_dma_tx(pmb887x_dif_t *p) {
 		return;
 
 	DPRINTF("new transfer: dma-flow tx\n");
-	// Enter continuous DMA-TX atomically: set state + flag together so the
-	// re-arm path (dif_event_handler, state==TX) keeps the burst cycle going,
-	// and dif_work does not self-terminate. (Don't use dif_kernel_reset here -
-	// its dif_schedule would run dif_work with dma_tx_cont still false and
-	// immediately reset back to NONE.)
 	p->state = DIF_STATE_TX;
 	p->tx_remaining = 0;
 	p->rx_remaining = 0;
@@ -500,10 +494,6 @@ static void dif_tx_from_fifo(pmb887x_dif_t *p) {
 		p->tx_remaining -= bytes_in_fifo_reg;
 
 		if (bsconf_size != 0) {
-			// A 32-bit FIFO word packs (4 / align) pixel-lanes, each carrying
-			// bsconf_size bytes on the bus (e.g. 2x8BIT/align=2 packs two 16-bit
-			// pixels). Serialize every lane, low byte first, matching the LCD's
-			// byte assembly order.
 			uint32_t lanes = 4 / align;
 			for (uint32_t lane = 0; lane < lanes; lane++) {
 				for (uint32_t i = 0; i < bsconf_size; i++) {
@@ -809,7 +799,7 @@ static void dif_io_write(void *opaque, hwaddr haddr, uint64_t value, unsigned si
 	pmb887x_dif_t *p = opaque;
 	
 	IO_DUMP(haddr + p->mmio.addr, size, value, true);
-	
+
 	switch (haddr) {
 		case DIFv2_CLC:
 			pmb887x_clc_set(&p->clc, value);
@@ -1085,6 +1075,9 @@ static void dif_init(Object *obj) {
 
 	for (int i = 0; i < ARRAY_SIZE(p->irq); i++)
 		sysbus_init_irq(SYS_BUS_DEVICE(obj), &p->irq[i]);
+
+	for (int i = 0; i < 32; i++)
+		p->bit_mux[i] = i;
 
 	// DMAC
 	qdev_init_gpio_in_named(dev, dif_handle_dmac_tx_clr, "DMAC_TX_CLR", 1);
