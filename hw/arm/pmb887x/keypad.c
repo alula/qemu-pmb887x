@@ -9,6 +9,7 @@
 #include "hw/hw.h"
 #include "hw/qdev-properties.h"
 #include "qapi/error.h"
+#include "qemu/timer.h"
 #include "ui/input.h"
 
 #include "hw/arm/pmb887x/gen/cpu_regs.h"
@@ -22,6 +23,7 @@
 #define KEYPAD_PORTS	3
 #define KEYPAD_MAX_IN	8
 #define KEYPAD_MAX_OUT	(4 * KEYPAD_PORTS)
+#define KEYPAD_POWERON_RELEASE_NS	(NANOSECONDS_PER_SECOND / 10)
 
 enum {
 	IRQ_KEY_PRESS,
@@ -52,6 +54,8 @@ struct pmb887x_keypad_t {
 	// Matrix bits (in: bits 0-7, out: bits 8+) of a key held down at power-on, so
 	// the firmware sees a power/END-key boot cause (KE970: END key KP_OUT1/KP_IN5).
 	uint32_t poweron_matrix;
+	QEMUTimer *poweron_timer;
+	bool poweron_release_scheduled;
 
 	qemu_irq gpio_out[4];
 };
@@ -151,6 +155,13 @@ static void keypad_io_write(void *opaque, hwaddr haddr, uint64_t value, unsigned
 		case KEYPAD_UNK1_SRC:
 		case KEYPAD_RELEASE_SRC:
 			pmb887x_src_set(&p->src[(haddr - KEYPAD_PRESS_SRC) / 4], value);
+			if (haddr == KEYPAD_RELEASE_SRC && (value & MOD_SRC_SRE) &&
+				p->poweron_timer && !p->poweron_release_scheduled) {
+				p->poweron_release_scheduled = true;
+				timer_mod(p->poweron_timer,
+					qemu_clock_get_ns(QEMU_CLOCK_VIRTUAL) +
+					KEYPAD_POWERON_RELEASE_NS);
+			}
 			break;
 		
 		default:
@@ -177,6 +188,34 @@ static QemuInputHandler keypad_input_handler = {
 
 static void keypad_handle_gpio_input(void *opaque, int id, int level) {
 	// nothing
+}
+
+static void keypad_release_poweron_key(void *opaque) {
+	pmb887x_keypad_t *p = opaque;
+	bool released = false;
+
+	for (int i = 0; i < KEYPAD_MAX_OUT; i++) {
+		if (!(p->poweron_matrix & (1 << (8 + i))))
+			continue;
+
+		for (int j = 0; j < KEYPAD_MAX_IN; j++) {
+			if (!(p->poweron_matrix & (1 << j)))
+				continue;
+
+			assert(p->state[i][j] > 0);
+			p->state[i][j]--;
+			if (!p->state[i][j]) {
+				uint8_t port = i / 4;
+				uint8_t shift = (i % 4) * 8;
+				p->port[port] |= (1 << j) << shift;
+			}
+			released = true;
+		}
+	}
+
+	if (released)
+		pmb887x_src_update(&p->src[IRQ_KEY_RELEASE], 0, MOD_SRC_SETR);
+	p->poweron_matrix = 0;
 }
 
 static void keypad_init(Object *obj) {
@@ -241,8 +280,11 @@ static void keypad_realize(DeviceState *dev, Error **errp) {
 				any = true;
 			}
 		}
-		if (any)
+		if (any) {
 			pmb887x_src_update(&p->src[IRQ_KEY_PRESS], 0, MOD_SRC_SETR);
+			p->poweron_timer = timer_new_ns(QEMU_CLOCK_VIRTUAL,
+				keypad_release_poweron_key, p);
+		}
 	}
 }
 

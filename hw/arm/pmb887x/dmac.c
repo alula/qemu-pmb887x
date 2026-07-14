@@ -91,15 +91,9 @@ static void dmac_schedule(pmb887x_dmac_t *p) {
 	}
 }
 
-static void dmac_transfer_finish(pmb887x_dmac_t *p, pmb887x_dmac_ch_t *ch) {
-	uint32_t flow_ctrl = (ch->config & DMAC_CH_CONFIG_FLOW_CTRL);
-	uint8_t src_periph = (ch->config & DMAC_CH_CONFIG_SRC_PERIPH) >> DMAC_CH_CONFIG_SRC_PERIPH_SHIFT;
-	uint8_t dst_periph = (ch->config & DMAC_CH_CONFIG_DST_PERIPH) >> DMAC_CH_CONFIG_DST_PERIPH_SHIFT;
-	uint8_t src_sel = p->sel[src_periph];
-	uint8_t dst_sel = p->sel[dst_periph];
-
+static bool dmac_load_next_lli(pmb887x_dmac_t *p, pmb887x_dmac_ch_t *ch) {
 	uint32_t lli_addr = ch->lli & DMAC_CH_LLI_ITEM;
-	if (lli_addr) {
+	while (lli_addr) {
 		uint32_t lli[4];
 		address_space_read(&p->downstream_as, lli_addr, MEMTXATTRS_UNSPECIFIED, lli, sizeof(lli));
 
@@ -108,12 +102,30 @@ static void dmac_transfer_finish(pmb887x_dmac_t *p, pmb887x_dmac_ch_t *ch) {
 		ch->lli = lli[2];
 		ch->control = lli[3];
 
-		DPRINTF("CH%d LLI=%08X [%08X, %08X, %08X, %08X]\n", ch->id, lli_addr, lli[0], lli[1], lli[2], lli[3]);
-	} else {
-		DPRINTF("CH%d: transfer done\n", ch->id);
-		ch->config &= ~DMAC_CH_CONFIG_ENABLE;
-		pmb887x_srb_set_isr(&p->srb_tc, (1 << ch->id));
+		uint32_t next = ch->lli & DMAC_CH_LLI_ITEM;
+		uint32_t tx_size = (ch->control & DMAC_CH_CONTROL_TRANSFER_SIZE) >> DMAC_CH_CONTROL_TRANSFER_SIZE_SHIFT;
+
+		if (tx_size == 0 && next == 0)
+			return false;
+
+		return true;
 	}
+	return false;
+}
+
+static void dmac_transfer_finish(pmb887x_dmac_t *p, pmb887x_dmac_ch_t *ch) {
+	uint32_t flow_ctrl = (ch->config & DMAC_CH_CONFIG_FLOW_CTRL);
+	uint8_t src_periph = (ch->config & DMAC_CH_CONFIG_SRC_PERIPH) >> DMAC_CH_CONFIG_SRC_PERIPH_SHIFT;
+	uint8_t dst_periph = (ch->config & DMAC_CH_CONFIG_DST_PERIPH) >> DMAC_CH_CONFIG_DST_PERIPH_SHIFT;
+	uint8_t src_sel = p->sel[src_periph];
+	uint8_t dst_sel = p->sel[dst_periph];
+
+	if (dmac_load_next_lli(p, ch))
+		return;
+
+	DPRINTF("CH%d: transfer done\n", ch->id);
+	ch->config &= ~DMAC_CH_CONFIG_ENABLE;
+	pmb887x_srb_set_isr(&p->srb_tc, (1 << ch->id));
 
 	bool is_dst_fc = (
 		flow_ctrl == DMAC_CH_CONFIG_FLOW_CTRL_MEM2PER ||
@@ -160,6 +172,14 @@ static void dmac_transfer_memory(pmb887x_dmac_t *p, pmb887x_dmac_ch_t *ch, uint3
 		flow_ctrl == DMAC_CH_CONFIG_FLOW_CTRL_MEM2PER ||
 		flow_ctrl == DMAC_CH_CONFIG_FLOW_CTRL_MEM2PER_PER
 	);
+	bool src_increment = (ch->control & DMAC_CH_CONTROL_SI) != 0;
+	bool dst_increment = (ch->control & DMAC_CH_CONTROL_DI) != 0;
+
+	if (flow_ctrl == DMAC_CH_CONFIG_FLOW_CTRL_PER2MEM ||
+		flow_ctrl == DMAC_CH_CONFIG_FLOW_CTRL_PER2MEM_PER) {
+		dst_increment = src_increment;
+		src_increment = false;
+	}
 
 	DPRINTF("CH%d: %08X [%dx%d] -> %08X [%dx%d]\n", ch->id, ch->src_addr, src_width, burst_size, ch->dst_addr, dst_width, burst_size);
 
@@ -173,10 +193,10 @@ static void dmac_transfer_memory(pmb887x_dmac_t *p, pmb887x_dmac_ch_t *ch, uint3
 			address_space_read(&p->downstream_as, ch->src_addr, MEMTXATTRS_UNSPECIFIED, buffer, src_width);
 			address_space_write(&p->downstream_as, ch->dst_addr, MEMTXATTRS_UNSPECIFIED, buffer, dst_width);
 
-			if ((ch->control & DMAC_CH_CONTROL_SI))
+			if (src_increment)
 				ch->src_addr += src_width;
 
-			if ((ch->control & DMAC_CH_CONTROL_DI))
+			if (dst_increment)
 				ch->dst_addr += dst_width;
 
 			burst_size--;
@@ -188,32 +208,32 @@ static void dmac_transfer_memory(pmb887x_dmac_t *p, pmb887x_dmac_ch_t *ch, uint3
 			address_space_read(&p->downstream_as, ch->src_addr, MEMTXATTRS_UNSPECIFIED, buffer + buffer_size, src_width);
 			buffer_size += src_width;
 
-			if ((ch->control & DMAC_CH_CONTROL_SI))
+			if (src_increment)
 				ch->src_addr += src_width;
 
 			if (buffer_size == dst_width) {
 				address_space_write(&p->downstream_as, ch->dst_addr, MEMTXATTRS_UNSPECIFIED, buffer, dst_width);
 				buffer_size = 0;
 
-				if ((ch->control & DMAC_CH_CONTROL_DI))
+				if (dst_increment)
 					ch->dst_addr += dst_width;
 			}
 			transfered++;
 		}
 	} else {
 		uint32_t transfered = 0;
-		uint32_t src_burst_size = src_is_memory && (ch->control & DMAC_CH_CONTROL_SI) ? burst_size : 1;
+		uint32_t src_burst_size = src_is_memory && src_increment ? burst_size : 1;
 		uint32_t src_burst_size_bytes = src_burst_size * src_width;
 		while (transfered < burst_size) {
 			address_space_read(&p->downstream_as, ch->src_addr, MEMTXATTRS_UNSPECIFIED, buffer, src_burst_size_bytes);
 
-			if ((ch->control & DMAC_CH_CONTROL_SI))
+			if (src_increment)
 				ch->src_addr += src_burst_size_bytes;
 
 			for (uint32_t j = 0; j < src_burst_size_bytes; j += dst_width) {
 				address_space_write(&p->downstream_as, ch->dst_addr, MEMTXATTRS_UNSPECIFIED, buffer + j, dst_width);
 
-				if ((ch->control & DMAC_CH_CONTROL_DI))
+				if (dst_increment)
 					ch->dst_addr += dst_width;
 			}
 			transfered += src_burst_size;
@@ -221,14 +241,11 @@ static void dmac_transfer_memory(pmb887x_dmac_t *p, pmb887x_dmac_ch_t *ch, uint3
 	}
 
 	if (tx_size > 0) {
-		if (!dmac_is_fc)
-			hw_error("TransferSize must be zero when peripheral is flow controller!");
-
 		tx_size -= MIN(tx_size, burst_count);
 		ch->control &= ~DMAC_CH_CONTROL_TRANSFER_SIZE;
 		ch->control |= tx_size << DMAC_CH_CONTROL_TRANSFER_SIZE_SHIFT;
 
-		if (tx_size == 0)
+		if (tx_size == 0 && dmac_is_fc)
 			dmac_transfer_finish(p, ch);
 	}
 }
