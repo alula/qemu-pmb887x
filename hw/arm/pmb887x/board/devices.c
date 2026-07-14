@@ -107,6 +107,17 @@ static pmb887x_dev_t devices_meta[] = {
 			{ "bgr_filter", DEV_PROP_BOOL, false },
 		},
 	},
+	{
+		.name = "r63400",
+		.props = {
+			{ "width", DEV_PROP_UINT, true },
+			{ "height", DEV_PROP_UINT, true },
+			{ "rotation", DEV_PROP_UINT, false },
+			{ "flip_horizontal", DEV_PROP_BOOL, false },
+			{ "flip_vertical", DEV_PROP_BOOL, false },
+			{ "bgr_filter", DEV_PROP_BOOL, false },
+		},
+	},
 
 	// PMIC
 	{
@@ -307,11 +318,6 @@ static DeviceState *device_create_from_config(DeviceState *ebuc, const char *id,
 					pmb887x_board_ebu_connect(DEVICE(bus), extra_cs, alias);
 				}
 			} else if (strcmp(type, "flash-tail") == 0) {
-				// A region of the flash image that lives past the NOR main array and
-				// is not wired through an EBU chip-select (the firmware accesses it at
-				// a fixed physical address). Map it directly into system memory,
-				// preloaded as-flashed from the tail of the fullflash image. Used for
-				// the KE970 NVRAM/caldata bank at 0xA8000000.
 				uint32_t address = toml_table_get_uint32(table, "address", 0, true);
 				uint32_t size = toml_table_get_uint32(table, "size", 0, true);
 
