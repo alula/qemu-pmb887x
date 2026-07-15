@@ -1210,7 +1210,7 @@
 #define DMAC_CH_LLI_LM_SHIFT					0
 #define DMAC_CH_LLI_LM_AHB1						0x0
 #define DMAC_CH_LLI_LM_AHB2						0x1
-#define DMAC_CH_LLI_ITEM						(0x1FFFFFFF << 2)	 // Linked list item
+#define DMAC_CH_LLI_ITEM						(0x3FFFFFFF << 2)	 // Linked list item
 #define DMAC_CH_LLI_ITEM_SHIFT					2
 
 #define DMAC_CH_CONTROL0						0x10C
@@ -6561,6 +6561,54 @@
 /* Module Identifier Register */
 #define SIM_ID		0x08
 
+#define SIM_CTRL		0x20
+#define SIM_CTRL_INCON		(1 << 0)
+#define SIM_CTRL_T0		(1 << 1)
+#define SIM_CTRL_IOL		(1 << 2)
+#define SIM_CTRL_EN		(1 << 3)
+#define SIM_CTRL_VCC		(1 << 4)
+#define SIM_CTRL_RST		(1 << 5)
+#define SIM_CTRL_ERROFF		(1 << 6)
+#define SIM_CTRL_RPTOFF		(1 << 7)
+#define SIM_CTRL_APDWN		(1 << 8)
+#define SIM_CTRL_PDWN		(1 << 9)
+#define SIM_CTRL_ON		(1 << 10)
+#define SIM_CTRL_CLKSEL		(1 << 11)
+#define SIM_CTRL_CLKHIGH	(1 << 12)
+#define SIM_CTRL_UARTON		(1 << 13)
+
+#define SIM_BRF			0x24
+#define SIM_STATUS		0x28
+#define SIM_STATUS_UARTOK	(1 << 0)
+#define SIM_STATUS_PARINT	(1 << 1)
+#define SIM_STATUS_OVRRUN	(1 << 2)
+#define SIM_STATUS_T0END	(1 << 3)
+#define SIM_STATUS_SIMDET	(1 << 4)
+#define SIM_STATUS_CHTIMEOUT	(1 << 5)
+
+#define SIM_IRQEN		0x2C
+#define SIM_IRQEN_OK		(1 << 0)
+#define SIM_IRQEN_PAR		(1 << 1)
+#define SIM_IRQEN_OVR		(1 << 2)
+#define SIM_IRQEN_T0END		(1 << 3)
+#define SIM_IRQEN_CHTIMER	(1 << 4)
+#define SIM_IRQEN_BWTIMER	(1 << 5)
+
+#define SIM_RXSPC		0x30
+#define SIM_TXSPC		0x34
+#define SIM_CHTIMER1		0x38
+#define SIM_UNK3C		0x3C
+#define SIM_BWT			0x44
+#define SIM_TX			0x50
+#define SIM_RX			0x54
+#define SIM_INS			0x58
+#define SIM_P3			0x5C
+#define SIM_SW1			0x60
+#define SIM_SW2			0x64
+#define SIM_UNK70		0x70
+#define SIM_UNK7C		0x7C
+#define SIM_UNK84		0x84
+
 
 // SSC [MOD_NUM=0045, MOD_REV=25, MOD_32BIT=00]
 // SSC [MOD_NUM=0045, MOD_REV=31, MOD_32BIT=00]
@@ -8452,6 +8500,4 @@
 #define VIC_CON_PRIORITY_SHIFT			0
 #define VIC_CON_FIQ						(1 << 8)
 #define VIC_CON_FIQ_SHIFT				8
-
-
 

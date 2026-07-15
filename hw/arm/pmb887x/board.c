@@ -217,6 +217,14 @@ static void pmb887x_init(MachineState *machine) {
 	DeviceState *rtc = pmb887x_new_cpu_module("RTC");
 	sysbus_realize_and_unref(SYS_BUS_DEVICE(rtc), &error_fatal);
 
+	// SIM
+	DeviceState *sim = pmb887x_new_cpu_module("SIM");
+	toml_datum_t sim_config = toml_table_get(pmb887x_board()->config, TOML_TABLE,
+		"sim", false);
+	qdev_prop_set_bit(sim, "card-present",
+		toml_table_get_bool(sim_config, "card_present", false, false));
+	sysbus_realize_and_unref(SYS_BUS_DEVICE(sim), &error_fatal);
+
 	// GPTU0
 	DeviceState *gptu0 = pmb887x_new_cpu_module("GPTU0");
 	object_property_set_link(OBJECT(gptu0), "pll", OBJECT(pll), &error_fatal);

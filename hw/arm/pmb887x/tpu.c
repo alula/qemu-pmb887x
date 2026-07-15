@@ -126,8 +126,9 @@ static void tpu_ptimer_reset(void *opaque) {
 	int64_t counter = tpu_get_time(p, true);
 	if (counter >= overflow) {
 		p->start = now;
-		p->counter = p->counter % overflow;
+		p->counter = counter % overflow;
 		p->irq_fired = 0;
+		pmb887x_src_update(&p->gp_src[0], 0, MOD_SRC_SETR);
 		
 		counter = p->counter;
 	}

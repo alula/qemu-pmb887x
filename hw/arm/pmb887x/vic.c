@@ -139,6 +139,15 @@ static uint64_t vic_io_read(void *opaque, hwaddr haddr, unsigned size) {
 			} else {
 				value = 0;
 			}
+
+			// uint64_t number = value & 0xff;
+			// static uint64_t last = (uint64_t)-1ull;
+			// // if (number != last) {
+			// if (number == 36 || (number > 134 && number <= 137)) {
+			// 	EPRINTF("irq: %lu\n", number);
+			// 	last = number;
+			// }
+
 			break;
 		
 		case VIC_IRQ_CURRENT:
